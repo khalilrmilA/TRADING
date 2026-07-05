@@ -316,7 +316,13 @@ const state = { coin: "BTCUSDT", tf: "1h", coins: ["BTCUSDT","ETHUSDT","SOLUSDT"
                 botAvailable: true, scanning: false, feedOpen: new Set(), intelOpen: null, intelData: null };
 const TFS = ["15m","1h","4h","1d"];
 
-const money = v => (v==null||isNaN(v)) ? "—" : "$" + Number(v).toLocaleString("en-US",{minimumFractionDigits:2, maximumFractionDigits:2});
+const money = v => {
+  if (v==null||isNaN(v)) return "—";
+  const n = Number(v);
+  // Meme-coin prices (PEPE ~$0.00001) need significant digits, not 2 decimals.
+  if (n !== 0 && Math.abs(n) < 0.01) return "$" + n.toPrecision(4);
+  return "$" + n.toLocaleString("en-US",{minimumFractionDigits:2, maximumFractionDigits:2});
+};
 const signMoney = v => (v==null||isNaN(v)) ? "—" : (v>=0?"+":"−") + money(Math.abs(v)).slice(1-0).replace(/^/,"$");
 const pct = v => (v==null||isNaN(v)) ? "" : ((v>=0?"+":"") + (100*v).toFixed(2) + "%");
 const cls = v => v>0.000001 ? "pos" : v<-0.000001 ? "neg" : "flat";

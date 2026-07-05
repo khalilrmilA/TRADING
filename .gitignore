@@ -1,0 +1,35 @@
+# --- Python ------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Secrets & local config ----------------------------------------------------
+# .env holds machine-specific config (capital, model names) — commit .env.example instead
+.env
+
+# --- Runtime data (paper-trading account, market cache) -------------------------
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.log
+logs/
+
+# --- Streamlit ------------------------------------------------------------------
+.streamlit/
+
+# --- IDE / OS -------------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Docker ---------------------------------------------------------------------
+*.pid

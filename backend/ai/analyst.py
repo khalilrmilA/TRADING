@@ -1,0 +1,460 @@
+"""AI market analyst built on the local Ollama server.
+
+PAPER TRADING ONLY — every analysis produced here is research output for a
+simulated-trading platform. It is not financial advice and never triggers any
+real order.
+
+``analyze_market`` compresses a feature-enriched OHLCV frame into a compact
+prompt (last-bar indicator snapshot + recent closes), asks the model for a
+strictly structured JSON verdict, validates it with pydantic (with one
+self-repair round-trip on malformed output) and persists every result to the
+``ai_analyses`` table.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+import pandas as pd
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from backend.ai.ollama_client import OllamaClient, OllamaError
+from backend.database.db import get_conn, utc_now_ms
+from backend.indicators.features import feature_summary
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+_LAST_CLOSES = 20
+
+_JSON_SCHEMA = """{
+  "sentiment": "bullish" | "bearish" | "neutral",
+  "confidence": <integer 0-100>,
+  "risk_commentary": "<1-3 sentences on the main risks to this view>",
+  "key_indicators": [
+    {"name": "<indicator name>", "value": "<current reading>", "influence": "<how it sways the outlook>"}
+  ],
+  "reasoning": "<concise reasoning tying the indicators together>"
+}"""
+
+_SYSTEM_PROMPT = (
+    "You are a senior market analyst at a quantitative RESEARCH firm. "
+    "This platform is a research and PAPER-TRADING simulation only: your output "
+    "is NOT financial advice and will never place a real order.\n\n"
+    "Respond ONLY with a single valid JSON object — no prose, no markdown code "
+    "fences, no extra keys — matching exactly this schema:\n"
+    f"{_JSON_SCHEMA}"
+)
+
+
+class KeyIndicator(BaseModel):
+    """One technical indicator reading and its influence on the outlook."""
+
+    name: str
+    value: str
+    influence: str
+
+
+class MarketAnalysis(BaseModel):
+    """Structured AI market assessment (research only, not financial advice)."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    sentiment: Literal["bullish", "bearish", "neutral"]
+    confidence: int  # 0-100
+    risk_commentary: str
+    key_indicators: list[KeyIndicator]
+    reasoning: str
+    model_used: str = ""
+    symbol: str = ""
+    timeframe: str = ""
+
+
+#: Window (bars) for the swing high/low and volume-trend structure summary.
+_SWING_WINDOW = 20
+#: Bars over which the SMA-20 slope decides the trend direction.
+_TREND_SLOPE_BARS = 10
+#: Slope dead-zone (fraction): |slope| below this reads as "sideways".
+_TREND_DEAD_ZONE = 0.005
+
+
+def _safe_float(value: Any) -> float | None:
+    """Coerce to a JSON-safe float rounded to 6 decimals; NaN/inf/None → None."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, 6)
+
+
+def chart_context(df: pd.DataFrame) -> dict[str, Any]:
+    """Summarise recent chart structure for the analyst prompt.
+
+    Gives the model a compressed view of price structure: the 20-bar swing
+    high/low with the percentage distance from the last close to each
+    (support/resistance proximity), the SMA-20 trend direction (sign of the
+    slope over the last 10 bars with a ±0.5% dead-zone), whether volume is
+    rising or falling, and the last five closes.
+
+    Purely descriptive and best-effort: missing columns or warm-up NaNs
+    degrade individual fields to ``None`` instead of raising, and every value
+    is JSON-safe (plain float/str/None).
+
+    Args:
+        df: Canonical OHLCV frame; a feature-enriched frame is welcome (an
+            existing ``sma_20`` column is reused instead of recomputed).
+
+    Returns:
+        dict with keys ``swing_high_20``, ``swing_low_20``,
+        ``dist_to_swing_high_pct``, ``dist_to_swing_low_pct``, ``trend_20``
+        (``"up" | "down" | "sideways"`` or None), ``volume_trend``
+        (``"rising" | "falling"`` or None) and ``last_5_closes``.
+    """
+    context: dict[str, Any] = {
+        "swing_high_20": None,
+        "swing_low_20": None,
+        "dist_to_swing_high_pct": None,
+        "dist_to_swing_low_pct": None,
+        "trend_20": None,
+        "volume_trend": None,
+        "last_5_closes": [],
+    }
+    if df is None or df.empty or "close" not in df.columns:
+        return context
+
+    closes = df["close"]
+    price = _safe_float(closes.iloc[-1])
+    context["last_5_closes"] = [
+        value for value in (_safe_float(c) for c in closes.tail(5)) if value is not None
+    ]
+
+    highs = df["high"] if "high" in df.columns else closes
+    lows = df["low"] if "low" in df.columns else closes
+    swing_high = _safe_float(highs.tail(_SWING_WINDOW).max())
+    swing_low = _safe_float(lows.tail(_SWING_WINDOW).min())
+    context["swing_high_20"] = swing_high
+    context["swing_low_20"] = swing_low
+    if price is not None and price > 0:
+        if swing_high is not None:
+            context["dist_to_swing_high_pct"] = round((swing_high - price) / price * 100.0, 4)
+        if swing_low is not None:
+            context["dist_to_swing_low_pct"] = round((price - swing_low) / price * 100.0, 4)
+
+    sma20 = df["sma_20"] if "sma_20" in df.columns else closes.rolling(20).mean()
+    if len(sma20) > _TREND_SLOPE_BARS:
+        current = _safe_float(sma20.iloc[-1])
+        past = _safe_float(sma20.iloc[-1 - _TREND_SLOPE_BARS])
+        if current is not None and past is not None and past != 0:
+            slope = (current - past) / abs(past)
+            if slope > _TREND_DEAD_ZONE:
+                context["trend_20"] = "up"
+            elif slope < -_TREND_DEAD_ZONE:
+                context["trend_20"] = "down"
+            else:
+                context["trend_20"] = "sideways"
+
+    if "volume" in df.columns:
+        volumes = [
+            value
+            for value in (_safe_float(v) for v in df["volume"].tail(_SWING_WINDOW))
+            if value is not None
+        ]
+        if len(volumes) >= 2:
+            half = len(volumes) // 2
+            earlier_avg = sum(volumes[:half]) / half
+            recent_avg = sum(volumes[half:]) / (len(volumes) - half)
+            context["volume_trend"] = "rising" if recent_avg > earlier_avg else "falling"
+
+    return context
+
+
+def _build_prompt(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    news_context: dict[str, Any] | None = None,
+) -> str:
+    """Build a compact analysis prompt from a feature-enriched frame.
+
+    Args:
+        symbol: Instrument symbol in the source's native format.
+        timeframe: Candle timeframe (e.g. ``"1h"``).
+        df: Feature-enriched canonical OHLCV frame.
+        news_context: Optional fresh news/community sentiment snapshot (score,
+            summary, top headlines, fear & greed) supplied by the intel layer
+            via the auto-trader. ``None`` (the default) omits the block and
+            leaves the prompt exactly as it was before the intel integration.
+
+    Returns:
+        The user prompt string containing the last-bar indicator snapshot,
+        a chart-structure summary (support/resistance distance, trend,
+        volume behaviour), an optional "NEWS & SENTIMENT" block and the
+        last 20 closing prices.
+    """
+    summary = feature_summary(df)
+    structure = chart_context(df)
+    closes = [round(float(c), 6) for c in df["close"].tail(_LAST_CLOSES).tolist()]
+    news_block = ""
+    if news_context:
+        news_block = (
+            "NEWS & SENTIMENT (crowd/news mood aggregated from public "
+            "sources; score runs -100 = very bearish to +100 = very "
+            "bullish — weigh it against the technicals, do not follow it "
+            "blindly):\n"
+            f"{json.dumps(news_context, default=str)}\n\n"
+        )
+    return (
+        f"Analyse {symbol} on the {timeframe} timeframe.\n\n"
+        f"Technical snapshot of the most recent bar:\n"
+        f"{json.dumps(summary, default=str)}\n\n"
+        f"CHART STRUCTURE (price structure over the recent window — distance "
+        f"to the 20-bar swing high/low i.e. resistance/support, SMA-20 trend "
+        f"direction, volume behaviour):\n"
+        f"{json.dumps(structure, default=str)}\n\n"
+        f"{news_block}"
+        f"Last {len(closes)} closing prices (oldest to newest):\n"
+        f"{json.dumps(closes)}\n\n"
+        "Return your assessment as the single JSON object described in the "
+        "system prompt."
+    )
+
+
+def _parse_analysis(raw: str) -> MarketAnalysis:
+    """Parse and validate a raw model reply into a ``MarketAnalysis``.
+
+    Normalises common model sloppiness before validation (case of the
+    sentiment label, numeric confidence coerced to int and clamped into
+    [0, 100], indicator fields stringified).
+
+    Args:
+        raw: Cleaned model output expected to be a JSON object.
+
+    Returns:
+        A validated ``MarketAnalysis`` (without symbol/timeframe/model set).
+
+    Raises:
+        ValueError: On any JSON/shape/validation problem
+            (``json.JSONDecodeError`` and pydantic's ``ValidationError`` are
+            both subclasses of ``ValueError``).
+    """
+    payload: Any = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError(f"model response is not a JSON object: {type(payload).__name__}")
+
+    if isinstance(payload.get("sentiment"), str):
+        payload["sentiment"] = payload["sentiment"].strip().lower()
+
+    raw_conf = payload.get("confidence", 0)
+    try:
+        confidence = int(round(float(raw_conf)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"confidence is not numeric: {raw_conf!r}") from exc
+    payload["confidence"] = max(0, min(100, confidence))
+
+    indicators = payload.get("key_indicators")
+    if isinstance(indicators, list):
+        payload["key_indicators"] = [
+            {
+                "name": str(item.get("name", "")),
+                "value": str(item.get("value", "")),
+                "influence": str(item.get("influence", "")),
+            }
+            for item in indicators
+            if isinstance(item, dict)
+        ]
+    payload["risk_commentary"] = str(payload.get("risk_commentary") or "")
+    payload["reasoning"] = str(payload.get("reasoning") or "")
+
+    return MarketAnalysis.model_validate(payload)
+
+
+def _persist(analysis: MarketAnalysis, raw_response: str) -> None:
+    """Write an analysis to the ``ai_analyses`` table.
+
+    Persistence failures are logged but never mask a successfully produced
+    analysis.
+
+    Args:
+        analysis: The validated analysis (symbol/timeframe/model already set).
+        raw_response: The raw (cleaned) model reply that produced it.
+    """
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO ai_analyses "
+                "(created_at, model, symbol, timeframe, sentiment, confidence, "
+                " risk_commentary, key_indicators, reasoning, raw_response) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    utc_now_ms(),
+                    analysis.model_used,
+                    analysis.symbol,
+                    analysis.timeframe,
+                    analysis.sentiment,
+                    int(analysis.confidence),
+                    analysis.risk_commentary,
+                    json.dumps([ki.model_dump() for ki in analysis.key_indicators]),
+                    analysis.reasoning,
+                    raw_response,
+                ),
+            )
+        logger.info(
+            "Persisted AI analysis: %s %s → %s (confidence %d)",
+            analysis.symbol, analysis.timeframe, analysis.sentiment, analysis.confidence,
+        )
+    except sqlite3.Error:
+        logger.exception("Failed to persist AI analysis for %s", analysis.symbol)
+
+
+def analyze_market(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    model: str | None = None,
+    news_context: dict[str, Any] | None = None,
+    allow_fallback: bool = True,
+) -> MarketAnalysis:
+    """Run an AI market analysis over a feature-enriched OHLCV frame.
+
+    Research only — the result is a structured opinion for paper-trading
+    experimentation, never financial advice.
+
+    Args:
+        symbol: Instrument symbol in the source's native format.
+        timeframe: Candle timeframe (``"1m" | "5m" | "15m" | "1h" | "4h" | "1d"``).
+        df: Feature-enriched canonical OHLCV frame (``add_features`` output).
+        model: Optional model override; defaults to ``settings.ollama_model``.
+        news_context: Optional fresh news/community sentiment snapshot from
+            the intel layer; when provided it is appended to the prompt as a
+            "NEWS & SENTIMENT" block. The default ``None`` keeps the prompt
+            (and therefore all pre-intel behaviour) unchanged.
+        allow_fallback: Passed through to ``OllamaClient.chat``. When False
+            the requested model is NEVER silently substituted with
+            ``settings.ollama_fallback_model`` — a missing/failing model
+            raises ``OllamaError`` instead (required by the auto-trader's
+            second-judge gate, whose contract mandates a conservative skip).
+
+    Returns:
+        A validated ``MarketAnalysis`` with ``model_used``, ``symbol`` and
+        ``timeframe`` populated and confidence clamped into [0, 100];
+        ``model_used`` records the model that ACTUALLY answered (the
+        resolved installed tag, or the fallback when it substituted). Every
+        result is persisted to the ``ai_analyses`` table.
+
+    Raises:
+        ValueError: When ``df`` is empty or missing the ``close`` column.
+        OllamaError: When the model is unreachable or still produces
+            unparseable output after one self-repair round-trip.
+    """
+    if df is None or df.empty:
+        raise ValueError(f"No data available to analyse for {symbol} ({timeframe}).")
+    if "close" not in df.columns:
+        raise ValueError("DataFrame is missing the required 'close' column.")
+
+    model_name = model or settings.ollama_model
+    client = OllamaClient()
+    prompt = _build_prompt(symbol, timeframe, df, news_context=news_context)
+
+    raw = client.chat(
+        prompt, system=_SYSTEM_PROMPT, model=model_name, json_mode=True,
+        temperature=0.2, allow_fallback=allow_fallback,
+    )
+    try:
+        analysis = _parse_analysis(raw)
+    except ValueError as exc:  # covers JSONDecodeError and ValidationError
+        logger.warning(
+            "AI analysis for %s failed to parse (%s) — attempting one repair round-trip",
+            symbol, exc,
+        )
+        repair_prompt = (
+            "Your previous reply was not a valid JSON object matching the "
+            f"required schema.\nError: {exc}\n\n"
+            f"Previous reply:\n{raw}\n\n"
+            "Rewrite it as a single valid JSON object matching exactly this "
+            f"schema (no prose, no markdown):\n{_JSON_SCHEMA}"
+        )
+        repaired = client.chat(
+            repair_prompt, system=_SYSTEM_PROMPT, model=model_name,
+            json_mode=True, temperature=0.0, allow_fallback=allow_fallback,
+        )
+        try:
+            analysis = _parse_analysis(repaired)
+            raw = repaired
+        except (ValueError, ValidationError) as exc2:
+            raise OllamaError(
+                f"Model '{model_name}' produced unparseable analysis for {symbol} "
+                f"even after a repair attempt: {exc2}"
+            ) from exc2
+
+    # Record the model that ACTUALLY answered — chat() may have resolved the
+    # requested name to a differently-tagged install or (when allowed)
+    # substituted the fallback model; persisting the requested name would
+    # misattribute the verdict in ai_analyses and the UI.
+    analysis.model_used = getattr(client, "last_model_used", None) or model_name
+    analysis.symbol = symbol
+    analysis.timeframe = timeframe
+
+    _persist(analysis, raw)
+    return analysis
+
+
+def get_analysis_history(symbol: str | None = None, limit: int = 50) -> list[dict]:
+    """Read past analyses from the ``ai_analyses`` table, newest first.
+
+    Args:
+        symbol: Optional symbol filter (exact match).
+        limit: Maximum number of rows to return.
+
+    Returns:
+        A list of dicts with keys ``id, created_at, model, symbol, timeframe,
+        sentiment, confidence, risk_commentary, key_indicators, reasoning``;
+        ``created_at`` is an ISO-8601 UTC string and ``key_indicators`` is a
+        JSON-decoded list.
+    """
+    query = (
+        "SELECT id, created_at, model, symbol, timeframe, sentiment, confidence, "
+        "risk_commentary, key_indicators, reasoning FROM ai_analyses"
+    )
+    params: list[object] = []
+    if symbol:
+        query += " WHERE symbol = ?"
+        params.append(symbol)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(int(limit))
+
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    items: list[dict] = []
+    for row in rows:
+        try:
+            indicators = json.loads(row["key_indicators"] or "[]")
+        except (TypeError, ValueError):
+            logger.warning("Malformed key_indicators JSON in ai_analyses row %s", row["id"])
+            indicators = []
+        items.append(
+            {
+                "id": row["id"],
+                "created_at": datetime.fromtimestamp(
+                    row["created_at"] / 1000, tz=timezone.utc
+                ).isoformat(),
+                "model": row["model"],
+                "symbol": row["symbol"],
+                "timeframe": row["timeframe"],
+                "sentiment": row["sentiment"],
+                "confidence": row["confidence"],
+                "risk_commentary": row["risk_commentary"],
+                "key_indicators": indicators,
+                "reasoning": row["reasoning"],
+            }
+        )
+    return items

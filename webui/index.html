@@ -166,6 +166,7 @@
 </header>
 
 <div id="bannerApi" class="banner"></div>
+<div id="bannerAI" class="banner"></div>
 <div id="bannerHalt" class="banner"></div>
 
 <div class="wrap">
@@ -407,6 +408,13 @@ async function refreshLive() {
   const ab = $("bannerApi");
   if (!apiOk) { ab.className="banner err"; ab.innerHTML = "❌ Cannot reach the trading engine (API on port 8000). Start it with <code>scripts\\start_backend.bat</code>."; $("apiDot").className="dot off"; }
   else { ab.className="banner"; $("apiDot").className="dot on"; }
+
+  // AI-offline banner: red only when the API answers AND says Ollama is down.
+  const aib = $("bannerAI");
+  let aiOffline = false;
+  if (apiOk) { try { const health = await api("/health"); aiOffline = health.ollama_available === false; } catch(e) {} }
+  if (aiOffline) { aib.className = "banner err"; aib.innerHTML = "🔌 AI offline — the trading brain is unreachable; AI-gated trades are paused. Watchdog is trying to restart it."; }
+  else aib.className = "banner";
 
   try { renderPositions((await api("/api/paper/positions?status=open")).items||[]); } catch(e){ renderPositions([]); }
   try { renderClosed((await api("/api/paper/positions?status=closed")).items||[]); } catch(e){ renderClosed([]); }

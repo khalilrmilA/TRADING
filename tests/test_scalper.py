@@ -44,6 +44,7 @@ import pytest
 
 import backend.data.service as data_service_mod
 import backend.paper_trading.auto_trader as auto_trader_mod
+import backend.paper_trading.regime as regime_mod
 import backend.paper_trading.scalper as scalper_mod
 from backend.ai.ollama_client import OllamaClient, OllamaError
 from backend.database.db import get_conn, upsert_ohlcv
@@ -324,8 +325,20 @@ def _set_watchlist(engine: PaperTradingEngine, symbols: list[str]) -> None:
 
 
 def _configure(scalper: Scalper, **overrides: Any) -> ScalperParams:
-    """Enable the scalper and apply per-test parameter overrides."""
-    updates: dict[str, Any] = {"enabled": True}
+    """Enable the scalper and apply per-test parameter overrides.
+
+    Baseline: the Improvement Pack v3 cost gate and ATR stop geometry are
+    switched OFF via their contract-sanctioned user knobs (``0 disables`` /
+    ``use_atr_geometry=False``) so this legacy suite keeps exercising the
+    fixed-percent entry/exit mechanics its assertions pin. The v3 gate,
+    geometry and tuner behaviors have their own binding acceptance suite in
+    tests/test_improvements_traders.py.
+    """
+    updates: dict[str, Any] = {
+        "enabled": True,
+        "cost_gate_multiple": 0.0,  # 0 disables the v3 entry cost gate
+        "use_atr_geometry": False,  # fixed tp_pct/sl_pct levels, as pinned below
+    }
     updates.update(overrides)
     return scalper.set_params(updates)
 
@@ -740,12 +753,33 @@ def test_no_long_entry_when_one_condition_fails(
     assert _scalp_activity("scalp_enter") == []
 
 
-def test_short_entry_mirrored() -> None:
-    """ema down + mirrored RSI band + close < vwap → one short scalp."""
+def test_short_entry_mirrored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ema down + mirrored RSI band + close < vwap → one short scalp.
+
+    The v3 regime hard gate only allows shorts when the coin AND BTCUSDT are
+    both in a 4h downtrend, so ``regime.get_regime`` is pinned to a
+    double-downtrend here (the gate itself is covered by the binding suite in
+    tests/test_improvements_traders.py).
+    """
     _seed(SHORT_SYMBOL, _short_ok_df())
     engine, scalper = _make_scalper()
     _set_watchlist(engine, [SHORT_SYMBOL])
     _configure(scalper)  # allowed_sides defaults to "both"
+
+    def _downtrend_regime(
+        source: str, symbol: str, ref_timeframe: str = "1h"
+    ) -> regime_mod.RegimeInfo:
+        return regime_mod.RegimeInfo(
+            regime="downtrend",
+            close=95.0,
+            ema50=97.0,
+            ema200=105.0,
+            bars_used=300,
+            pct_change_7d=-5.0,
+            pct_change_30d=-12.0,
+        )
+
+    monkeypatch.setattr(regime_mod, "get_regime", _downtrend_regime)
 
     scalper.run_tick()
 
@@ -963,10 +997,17 @@ def test_max_trades_per_day_guard() -> None:
 def test_tune_clamps_out_of_range_ai_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Wild AI proposals are clamped to HARD_BOUNDS; unknown params ignored."""
+    """Wild AI proposals are clamped to HARD_BOUNDS; unknown params ignored.
+
+    ``position_fraction`` and ``max_trades_per_day`` start AT their hard-bound
+    ceilings: below SHRINK_ONLY_MIN_TRADES closed trades the v3 shrink-only
+    tuner phase would revert any RAISE of them (that behavior has its own
+    binding tests in tests/test_improvements_traders.py) — starting at the
+    ceiling keeps this test pinned on pure HARD_BOUNDS clamping.
+    """
     engine, scalper = _make_scalper()
     _set_watchlist(engine, [LONG_SYMBOL])
-    _configure(scalper)
+    _configure(scalper, position_fraction=0.10, max_trades_per_day=100)
     stub = _patch_chat(
         monkeypatch,
         response=json.dumps(

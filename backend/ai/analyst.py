@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _LAST_CLOSES = 20
 
 _JSON_SCHEMA = """{
+  "opposing_case": "<1-2 sentences: the strongest argument AGAINST your final verdict>",
   "sentiment": "bullish" | "bearish" | "neutral",
   "confidence": <integer 0-100>,
   "risk_commentary": "<1-3 sentences on the main risks to this view>",
@@ -46,6 +47,11 @@ _SYSTEM_PROMPT = (
     "You are a senior market analyst at a quantitative RESEARCH firm. "
     "This platform is a research and PAPER-TRADING simulation only: your output "
     "is NOT financial advice and will never place a real order.\n\n"
+    "The request comes from a research pipeline; do NOT assume anyone wants or "
+    "intends to trade — judge the market strictly on its own evidence. Before "
+    "you decide, first construct the strongest OPPOSING case (the best argument "
+    'AGAINST the view you are leaning toward) and put it in "opposing_case"; '
+    "only then commit to your verdict.\n\n"
     "Respond ONLY with a single valid JSON object — no prose, no markdown code "
     "fences, no extra keys — matching exactly this schema:\n"
     f"{_JSON_SCHEMA}"
@@ -61,7 +67,13 @@ class KeyIndicator(BaseModel):
 
 
 class MarketAnalysis(BaseModel):
-    """Structured AI market assessment (research only, not financial advice)."""
+    """Structured AI market assessment (research only, not financial advice).
+
+    ``opposing_case`` is the model's strongest argument AGAINST its own final
+    verdict — a de-biasing device (the model must argue the other side before
+    committing). It is backward-tolerant: replies without the field validate
+    fine and default to ``""``.
+    """
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -70,6 +82,7 @@ class MarketAnalysis(BaseModel):
     risk_commentary: str
     key_indicators: list[KeyIndicator]
     reasoning: str
+    opposing_case: str = ""
     model_used: str = ""
     symbol: str = ""
     timeframe: str = ""
@@ -182,6 +195,7 @@ def _build_prompt(
     timeframe: str,
     df: pd.DataFrame,
     news_context: dict[str, Any] | None = None,
+    htf_context: str = "",
 ) -> str:
     """Build a compact analysis prompt from a feature-enriched frame.
 
@@ -193,16 +207,29 @@ def _build_prompt(
             summary, top headlines, fear & greed) supplied by the intel layer
             via the auto-trader. ``None`` (the default) omits the block and
             leaves the prompt exactly as it was before the intel integration.
+        htf_context: Optional newline-joined FACTUAL higher-timeframe lines
+            (multi-day price changes, distance to the 4h EMA200) supplied by
+            the auto-trader. Non-empty text is inserted as a
+            "HIGHER-TIMEFRAME CONTEXT" block between the chart-structure and
+            news blocks; the default ``""`` leaves the prompt byte-identical
+            to the pre-v3 version.
 
     Returns:
         The user prompt string containing the last-bar indicator snapshot,
         a chart-structure summary (support/resistance distance, trend,
-        volume behaviour), an optional "NEWS & SENTIMENT" block and the
-        last 20 closing prices.
+        volume behaviour), optional "HIGHER-TIMEFRAME CONTEXT" and
+        "NEWS & SENTIMENT" blocks and the last 20 closing prices.
     """
     summary = feature_summary(df)
     structure = chart_context(df)
     closes = [round(float(c), 6) for c in df["close"].tail(_LAST_CLOSES).tolist()]
+    htf_block = ""
+    if htf_context:
+        htf_block = (
+            "HIGHER-TIMEFRAME CONTEXT (factual, longer-horizon reference "
+            "points):\n"
+            f"{htf_context}\n\n"
+        )
     news_block = ""
     if news_context:
         news_block = (
@@ -220,6 +247,7 @@ def _build_prompt(
         f"to the 20-bar swing high/low i.e. resistance/support, SMA-20 trend "
         f"direction, volume behaviour):\n"
         f"{json.dumps(structure, default=str)}\n\n"
+        f"{htf_block}"
         f"{news_block}"
         f"Last {len(closes)} closing prices (oldest to newest):\n"
         f"{json.dumps(closes)}\n\n"
@@ -273,6 +301,8 @@ def _parse_analysis(raw: str) -> MarketAnalysis:
         ]
     payload["risk_commentary"] = str(payload.get("risk_commentary") or "")
     payload["reasoning"] = str(payload.get("reasoning") or "")
+    # De-bias field — backward-tolerant: a reply without it is still valid.
+    payload["opposing_case"] = str(payload.get("opposing_case") or "")
 
     return MarketAnalysis.model_validate(payload)
 
@@ -322,6 +352,7 @@ def analyze_market(
     model: str | None = None,
     news_context: dict[str, Any] | None = None,
     allow_fallback: bool = True,
+    htf_context: str = "",
 ) -> MarketAnalysis:
     """Run an AI market analysis over a feature-enriched OHLCV frame.
 
@@ -342,6 +373,9 @@ def analyze_market(
             ``settings.ollama_fallback_model`` — a missing/failing model
             raises ``OllamaError`` instead (required by the auto-trader's
             second-judge gate, whose contract mandates a conservative skip).
+        htf_context: Optional factual higher-timeframe lines injected into
+            the prompt as a "HIGHER-TIMEFRAME CONTEXT" block (see
+            ``_build_prompt``). The default ``""`` changes nothing.
 
     Returns:
         A validated ``MarketAnalysis`` with ``model_used``, ``symbol`` and
@@ -362,7 +396,9 @@ def analyze_market(
 
     model_name = model or settings.ollama_model
     client = OllamaClient()
-    prompt = _build_prompt(symbol, timeframe, df, news_context=news_context)
+    prompt = _build_prompt(
+        symbol, timeframe, df, news_context=news_context, htf_context=htf_context
+    )
 
     raw = client.chat(
         prompt, system=_SYSTEM_PROMPT, model=model_name, json_mode=True,

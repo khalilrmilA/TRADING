@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     # --- Data updates ----------------------------------------------------------
     data_update_interval_minutes: int = 15
 
+    # --- Improvement pack v3 -----------------------------------------------------
+    heat_cap_fraction: float = 0.06  # portfolio stop-distance risk cap vs equity
+    max_same_direction: int = 5  # max open positions in one direction, platform-wide
+    # Windows install path of the Ollama desktop app; %VARS% are expanded with
+    # os.path.expandvars at USE time (the watchdog), never at load time.
+    ollama_app_path: str = "%LOCALAPPDATA%/Programs/Ollama/ollama app.exe"
+    ollama_watchdog_enabled: bool = True
+
     @property
     def api_url(self) -> str:
         """Base URL of the backend API."""

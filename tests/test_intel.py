@@ -571,6 +571,12 @@ def _configure(trader: AutoTrader, **overrides: Any) -> BotConfig:
         "use_ai": False,
         "min_vote": 2,
         "allow_short": False,
+        # This module tests the intel (sentiment/playbook) integration; the
+        # Improvement Pack v3 cost gate is disabled via its contract knob
+        # (0 disables) — the low-ATR fixtures here would otherwise be
+        # cost-gated before the behaviors under test run. The v3 gates have
+        # their own binding suite in tests/test_improvements_traders.py.
+        "cost_gate_multiple": 0.0,
     }
     updates.update(overrides)
     return trader.set_config(updates)
@@ -1019,7 +1025,12 @@ def test_coach_clamps_llm_proposals_and_writes_coach_tune(
 ) -> None:
     """Out-of-range proposals are clamped and every change logs coach_tune."""
     _persist_bot_config([COACH_HI, COACH_LO])
-    _seed_closed_positions(COACH_HI, [12.0, -6.0, 9.0, -3.0])  # 4 closed trades
+    # 20 closed trades: enough evidence for the v3 shrink-only coach gates
+    # (COACH_SIZE_UP_MIN_TRADES=20, COACH_SIDE_BIAS_MIN_TRADES=10), so the
+    # size-up to 1.5 and the long_only bias below stay permitted and this
+    # test keeps pinning the pure bounds-clamping behavior. The evidence
+    # gates themselves are covered in tests/test_improvements_risk_coach.py.
+    _seed_closed_positions(COACH_HI, [12.0, -6.0, 9.0, -3.0] * 5)
     _seed_closed_positions(COACH_LO, [-8.0, -5.0, -7.0])  # 3 closed trades
     stub = _patch_chat(
         monkeypatch,

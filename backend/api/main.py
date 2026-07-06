@@ -25,6 +25,8 @@ import dataclasses
 import json
 import logging
 import math
+import os
+import subprocess
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -738,6 +740,208 @@ def _intel_status() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Ollama watchdog — monitors the local LLM server, restarts the desktop app
+# when it goes down, and persists the availability state that the traders
+# and /health read. PAPER TRADING ONLY — this only keeps the local AI alive.
+# ---------------------------------------------------------------------------
+
+OLLAMA_WATCHDOG_JOB_ID = "ollama_watchdog"
+OLLAMA_STATUS_KEY = "ollama_status"  # account_state key — the cross-module contract
+OLLAMA_FAIL_THRESHOLD = 3  # consecutive failures before "offline"
+OLLAMA_RESTART_COOLDOWN_MS = 600_000  # at most one restart attempt per 10 minutes
+
+# Lock-guarded module state: consecutive-failure count + last-restart-attempt ms.
+_watchdog_lock = threading.Lock()
+_ollama_fail_count = 0
+_ollama_last_restart_ms = 0
+
+
+def _read_ollama_status() -> dict[str, Any] | None:
+    """The watchdog's persisted status (``account_state['ollama_status']``).
+
+    Returns:
+        The persisted ``{"available", "since_ms", "restarts"}`` dict, or
+        ``None`` when the watchdog has never written it or the key is
+        unreadable/malformed. Per contract, a missing status means ONLINE —
+        a watchdog that never ran must not block anything. Never raises.
+    """
+    try:
+        from backend.database.db import get_conn
+        from backend.paper_trading.engine import PaperTradingEngine
+
+        conn = get_conn()
+        try:
+            raw = PaperTradingEngine._state_get(conn, OLLAMA_STATUS_KEY, None)
+        finally:
+            conn.close()
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        logger.debug("Could not read %r — treating Ollama as online", OLLAMA_STATUS_KEY)
+        return None
+
+
+def _write_ollama_status(available: bool, since_ms: int, restarts: int) -> None:
+    """Persist the Ollama status to ``account_state`` (best-effort, never raises).
+
+    Args:
+        available: Whether the local Ollama server currently answers.
+        since_ms: Epoch ms (UTC) when the CURRENT state began.
+        restarts: Cumulative restart attempts (monotonically increasing).
+    """
+    status = {"available": bool(available), "since_ms": int(since_ms), "restarts": int(restarts)}
+    try:
+        from backend.database.db import get_conn
+        from backend.paper_trading.engine import PaperTradingEngine
+
+        conn = get_conn()
+        try:
+            with conn:
+                PaperTradingEngine._state_set(conn, OLLAMA_STATUS_KEY, status)
+        finally:
+            conn.close()
+        logger.info("Ollama status persisted: %s", status)
+    except Exception:
+        logger.exception("Could not persist the Ollama status %s", status)
+
+
+def _launch_ollama_app(path: str) -> bool:
+    """Try to launch the Ollama desktop app at ``path`` (never raises).
+
+    A missing file (e.g. Docker/POSIX host) logs a warning and skips the
+    launch. Popen failures are logged and still counted as an attempt.
+
+    Args:
+        path: Filesystem path of the app, env-vars already expanded.
+
+    Returns:
+        True when a launch was attempted (the file exists), else False.
+    """
+    if not os.path.isfile(path):
+        logger.warning(
+            "Ollama app not found at %r — restart skipped (set OLLAMA_APP_PATH "
+            "if it is installed somewhere else)",
+            path,
+        )
+        return False
+    try:
+        subprocess.Popen(  # noqa: S603 — fixed local app path, no shell
+            [path], shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        logger.info("Ollama restart attempted via %r", path)
+    except Exception:
+        logger.exception("Failed to launch the Ollama app at %r", path)
+    return True
+
+
+def _run_ollama_watchdog() -> None:
+    """Scheduler target: one Ollama liveness pass every 60 seconds.
+
+    State-transition-only logging: exactly when the consecutive-failure count
+    reaches ``OLLAMA_FAIL_THRESHOLD`` the persisted status flips to
+    unavailable and ONE ``bot_activity`` ``error`` row is written — later
+    failing passes only retry the guarded restart (at most one attempt per
+    ``OLLAMA_RESTART_COOLDOWN_MS``). Recovery flips the status back silently.
+    NEVER raises.
+    """
+    global _ollama_fail_count, _ollama_last_restart_ms
+    try:
+        ok = False
+        try:
+            from backend.ai.ollama_client import OllamaClient
+
+            ok = OllamaClient().is_available()
+        except Exception as exc:
+            logger.warning("Ollama availability check failed: %s", exc)
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        status = _read_ollama_status()
+        restarts = 0
+        if status is not None:
+            try:
+                restarts = max(0, int(status.get("restarts") or 0))
+            except (TypeError, ValueError):
+                restarts = 0
+
+        if ok:
+            with _watchdog_lock:
+                _ollama_fail_count = 0
+            # Transition-only write: flip the persisted state back to
+            # available (restart counter kept). No activity row on recovery.
+            if status is None or not status.get("available"):
+                _write_ollama_status(True, now_ms, restarts)
+                logger.info("Ollama is answering again — AI-gated trading resumes")
+            return
+
+        with _watchdog_lock:
+            _ollama_fail_count += 1
+            failures = _ollama_fail_count
+            cooldown_over = now_ms - _ollama_last_restart_ms > OLLAMA_RESTART_COOLDOWN_MS
+        if failures < OLLAMA_FAIL_THRESHOLD:
+            return
+
+        # At threshold AND on every later failing pass: guarded restart —
+        # at most one attempt per cooldown window.
+        app_path = os.path.expandvars(settings.ollama_app_path)
+        restart_attempted = False
+        if cooldown_over:
+            restart_attempted = _launch_ollama_app(app_path)
+            if restart_attempted:
+                restarts += 1
+                with _watchdog_lock:
+                    _ollama_last_restart_ms = now_ms
+
+        if failures == OLLAMA_FAIL_THRESHOLD:
+            # The state transition: persist "offline" and log ONE error row.
+            _write_ollama_status(False, now_ms, restarts)
+            try:
+                get_auto_trader()._log(
+                    "error",
+                    symbol="",
+                    detail={
+                        "where": "ollama_watchdog",
+                        "reason": "ai_offline",
+                        "consecutive_failures": failures,
+                        "restart_attempted": restart_attempted,
+                        "app_path": app_path,
+                        "explanation": (
+                            "The local AI (Ollama) stopped answering — AI-confirmed "
+                            "entries are paused and the watchdog is trying to "
+                            "restart it."
+                        ),
+                    },
+                )
+            except Exception:
+                logger.exception("Could not write the ollama_watchdog error activity row")
+        elif restart_attempted:
+            # Later failing pass: keep the state's since_ms, bump restarts.
+            since_ms = now_ms
+            if status is not None:
+                try:
+                    since_ms = int(status.get("since_ms") or now_ms)
+                except (TypeError, ValueError):
+                    since_ms = now_ms
+            _write_ollama_status(False, since_ms, restarts)
+    except Exception:  # noqa: BLE001 — a watchdog must never raise into the scheduler
+        logger.exception("Ollama watchdog pass failed")
+
+
+def _ensure_ollama_watchdog_job() -> None:
+    """Register the 60-second ``ollama_watchdog`` job on the bot scheduler."""
+    with _bot_scheduler_lock:
+        _scheduler_locked().add_job(
+            _run_ollama_watchdog,
+            trigger="interval",
+            seconds=60,
+            id=OLLAMA_WATCHDOG_JOB_ID,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=30,
+        )
+        logger.info("Ollama watchdog job '%s' scheduled every 60 s", OLLAMA_WATCHDOG_JOB_ID)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -856,6 +1060,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logger.exception("Could not restore the intel schedule; intel/coach jobs not registered")
 
+    # Ollama watchdog: keep the local AI alive (60 s liveness checks, guarded
+    # restarts). Registered whenever enabled in settings — no persisted flag.
+    if settings.ollama_watchdog_enabled:
+        try:
+            _ensure_ollama_watchdog_job()
+        except Exception:
+            logger.exception("Could not start the Ollama watchdog; API continues without it")
+
     try:
         yield
     finally:
@@ -967,7 +1179,21 @@ def health() -> HealthResponse:
         logger.error("Database health check failed: %s", exc)
         db_status = "error"
 
-    return HealthResponse(status="ok", ollama_available=ollama_available, db=db_status, paper_only=True)
+    ollama_since_ms: int | None = None
+    status = _read_ollama_status()
+    if status is not None and status.get("since_ms") is not None:
+        try:
+            ollama_since_ms = int(status["since_ms"])
+        except (TypeError, ValueError):
+            ollama_since_ms = None
+
+    return HealthResponse(
+        status="ok",
+        ollama_available=ollama_available,
+        db=db_status,
+        paper_only=True,
+        ollama_since_ms=ollama_since_ms,
+    )
 
 
 @app.get("/api/models", response_model=ModelsResponse)
@@ -1287,13 +1513,17 @@ def reset_paper_account() -> StatusResponse:
     (``running=False`` / ``enabled=False``): a fresh account never trades
     or re-tunes unattended until explicitly started again. Scheduler jobs
     are removed to match, and the coach's ``coin_playbook`` rows are cleared
-    — they were learned from the wiped account's trades.
+    — they were learned from the wiped account's trades. The watchdog's
+    ``ollama_status`` is likewise snapshotted and re-persisted: a money
+    reset must not make an offline Ollama look online (missing key = ONLINE
+    per contract) nor zero the monotonic ``restarts`` counter.
     """
     trader = get_auto_trader()
     scalper = get_scalper()
     bot_cfg = trader.get_config().model_dump()
     scalp_cfg = scalper.get_params().model_dump()
     intel_cfg = _intel_config()
+    ollama_status = _read_ollama_status()
 
     get_engine().reset()
     _remove_bot_job()
@@ -1329,6 +1559,25 @@ def reset_paper_account() -> StatusResponse:
                 conn.close()
         except Exception:
             logger.exception("Could not restore intel config after reset — defaults apply")
+
+    # Restore the watchdog's persisted Ollama status: it is INFRASTRUCTURE
+    # state, not account state. Wiping it would make an offline Ollama look
+    # ONLINE (missing key = online per contract) until the watchdog's next
+    # persisting pass — up to the whole restart cooldown — re-arming the
+    # per-candidate timeout storm the ai_offline gates exist to prevent, and
+    # would zero the contractually monotonic `restarts` counter.
+    if ollama_status is not None:
+        try:
+            _write_ollama_status(
+                bool(ollama_status.get("available")),
+                int(ollama_status.get("since_ms") or 0),
+                int(ollama_status.get("restarts") or 0),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Malformed ollama_status snapshot %r — not restored after reset",
+                ollama_status,
+            )
 
     logger.info(
         "Paper account reset to initial capital — user configuration preserved, "

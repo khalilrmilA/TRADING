@@ -732,3 +732,504 @@ sentiment gives bonus 0; set_config clamps sentiment_rank_weight to [0, 2]. Offl
 - `README.md`: overview, PAPER-ONLY disclaimer, architecture diagram (ASCII), hardware/model guidance
   (RTX 5060 Ti 16GB → qwen3:14b default; qwen3:30b-a3b quality option; 32B dense models supported but CPU-offloaded),
   setup (Windows native + Docker), usage walkthrough, API table, ASCII dashboard mockup, troubleshooting.
+
+## Improvement Pack v3
+
+Binding contracts for the v3 improvement wave: market-regime gating, cost gating, shadow
+diagnostics, R-multiple logging, judge de-biasing, ATR-geometry scalping, shrink-only tuning,
+portfolio heat / direction caps, drawdown de-risking, coach evidence gates, and an Ollama
+watchdog. **PAPER ONLY — nothing here changes that.** No schema.sql changes in this pack: every
+new action/reason fits the existing `bot_activity` shape and every new persisted blob lives in
+`account_state`.
+
+Conventions for this section:
+- Detail-JSON shapes list REQUIRED keys. Extra keys are permitted; listed keys must be present
+  with exactly these names. All numeric detail values go through the existing `_json_num`
+  (round 6, NaN/inf → null).
+- All `*_pct` values in the new gate/geometry math are **fractions** (0.006 = 0.6%), consistent
+  with `settings.commission_rate` / `settings.slippage_rate` — NOT percentage points. Exception:
+  `pct_change_7d` / `pct_change_30d` on `RegimeInfo` and `atr_pctile` in shadow flags are
+  human-scale percentages (−100..100 / 0..100), because they feed prompts and dashboards.
+- New reason strings are binding EXACT values (or exact prefixes where a `:`-suffixed
+  explanation follows, matching the existing `stale_data: ...` convention).
+- Private helper names below are RECOMMENDED; public functions, classes, fields, defaults,
+  clamps, config/state keys, reason strings and detail shapes are BINDING.
+
+### 1. backend/paper_trading/regime.py — NEW MODULE — owner: builder-regime
+
+Pure, read-only market-regime utilities. Reads market data ONLY via
+`backend.database.db.load_ohlcv` (cache-only — never fetches, never writes any table). Must not
+import `engine`, `auto_trader` or `scalper` (both traders import THIS module). pandas/numpy +
+`backend.indicators.technical` only. Every public function is cheap and NEVER raises (any
+internal failure degrades to the conservative/neutral result and logs a warning).
+
+```
+# Module constants (binding values)
+REF_TIMEFRAME = "1h"                    # source candles for the regime
+RESAMPLE_RULE = "4h"                    # pandas resample rule applied to the 1h closes
+REGIME_LOOKBACK_1H_BARS = 1500          # load_ohlcv limit (~62 days of 1h → ~375 4h bars)
+MIN_4H_BARS = 220                       # fewer usable 4h closes → regime "neutral"
+EMA_FAST = 50
+EMA_SLOW = 200
+SHADOW_VOL_MULT = 1.5                   # volume_ok threshold vs SMA20(volume)
+SHADOW_ATR_WINDOW = 100                 # bars ranked for the ATR percentile
+SHADOW_ATR_BAND = (20.0, 90.0)          # atr_in_band inclusive bounds
+DEAD_ZONE_HOURS = (2, 5)                # dead_zone: 2 <= hour_utc < 5
+
+@dataclass(frozen=True)
+class RegimeInfo:
+    regime: str                         # "uptrend" | "downtrend" | "neutral"
+    close: float | None                 # last 4h close used (None when no data)
+    ema50: float | None                 # EMA50 of 4h closes (None when < MIN_4H_BARS)
+    ema200: float | None                # EMA200 of 4h closes (None when < MIN_4H_BARS)
+    bars_used: int                      # usable 4h closes after resample+dropna
+    pct_change_7d: float | None         # % change vs 168 1h bars ago (human %, round 4)
+    pct_change_30d: float | None        # % change vs 720 1h bars ago (human %, round 4)
+
+def get_regime(source: str, symbol: str, ref_timeframe: str = "1h") -> RegimeInfo
+def regime_allows(side: str, symbol_regime: str, btc_regime: str) -> bool
+def cost_gate(atr: float | None, price: float | None, commission_pct: float,
+              slippage_pct: float, multiple: float) -> dict[str, Any]
+def shadow_flags(df: pd.DataFrame, entry_ts_utc_hour: int) -> dict[str, Any]
+```
+
+`get_regime` computation (binding):
+1. `df = load_ohlcv(source, symbol, ref_timeframe, limit=REGIME_LOOKBACK_1H_BARS)` — cache
+   only. Empty → `RegimeInfo("neutral", None, None, None, 0, None, None)`.
+2. `pct_change_7d` / `pct_change_30d` from the 1h closes: `(last / close[-1-N] - 1) * 100` with
+   N=168 / N=720; `None` when the frame is too short (round 4).
+3. `closes_4h = df["close"].resample(RESAMPLE_RULE, label="right", closed="right").last().dropna()`;
+   `bars_used = len(closes_4h)`. No unclosed-candle drop (observation-grade EMA smoothing).
+4. `bars_used < MIN_4H_BARS` → regime `"neutral"`, `ema50 = ema200 = None`,
+   `close =` last 4h close. (Conservative by design: neutral blocks shorts, allows longs.)
+5. Else `ema50/ema200 = technical.ema(closes_4h, 50/200).iloc[-1]`, `close = closes_4h.iloc[-1]`:
+   `uptrend` iff `close > ema200 AND ema50 > ema200`; `downtrend` iff
+   `close < ema200 AND ema50 < ema200`; else `neutral`.
+Callers cache results per cycle/tick — `get_regime` itself does no caching.
+
+`regime_allows` — the single shared gate predicate (both traders MUST use it):
+```
+both_down = (symbol_regime == "downtrend") and (btc_regime == "downtrend")
+return both_down if side == "short" else not both_down       # side: "long" | "short"
+```
+i.e. SHORT allowed only when symbol AND BTCUSDT are both in a 4h downtrend; LONG blocked only in
+that same double-downtrend state; every other combination allows longs and blocks shorts.
+
+`cost_gate` (binding): `round_trip = 2.0 * (commission_pct + slippage_pct)`;
+`needed_pct = max(0.0, multiple) * round_trip`; `expected_move_pct = atr / price` when both are
+finite and > 0, else `None`. Returns
+`{"passes": bool, "expected_move_pct": float | None, "needed_pct": float}`.
+`multiple <= 0` → `passes=True, needed_pct=0.0` (gate disabled). Otherwise
+`passes = expected_move_pct is not None and expected_move_pct >= needed_pct` (invalid ATR/price
+fails conservatively).
+
+`shadow_flags` (binding — PURE OBSERVATION, never gates, never raises). `df` is a
+feature-enriched canonical frame (1h for the bot, 15m for the scalper);
+`entry_ts_utc_hour` is `datetime.now(timezone.utc).hour` at entry time. Returns:
+```
+{
+  "volume_ok":   bool | None,   # last volume >= SHADOW_VOL_MULT * SMA20(volume); None when
+                                #   volume missing or < 20 rows
+  "atr_pctile":  float | None,  # 100 * (# of window ATR values <= current) / n, window = last
+                                #   min(100, available) finite atr_14 values INCL. current bar,
+                                #   round 2; None when < 20 finite ATR values
+  "atr_in_band": bool | None,   # 20.0 <= atr_pctile <= 90.0; None when atr_pctile is None
+  "dead_zone":   bool           # 2 <= entry_ts_utc_hour < 5 (UTC)
+}
+```
+Uses the `atr_14` column when present, else computes `technical.atr(df, 14)`.
+
+### 2. config/settings.py additions — owner: builder-api
+
+Append to `Settings` (all env-overridable like every existing field):
+```
+# --- Improvement pack v3 ---
+heat_cap_fraction: float = 0.06          # portfolio stop-distance risk cap vs equity
+max_same_direction: int = 5              # max open positions in one direction, platform-wide
+ollama_app_path: str = "%LOCALAPPDATA%/Programs/Ollama/ollama app.exe"   # expandvars at USE time
+ollama_watchdog_enabled: bool = True
+```
+
+### 3. backend/paper_trading/risk.py — owner: builder-risk
+
+```
+NO_STOP_RISK_FRACTION = 0.02             # stop-distance reference for positions without a stop
+
+class RiskManager:                        # existing methods unchanged, plus:
+    @staticmethod
+    def portfolio_heat(open_positions: list[dict[str, Any]]) -> float
+        # DOLLARS of stop-distance risk across OPEN positions:
+        # per position: |entry_price - stop_loss| * qty when stop_loss is finite and the
+        # distance > 0; else entry_price * qty * NO_STOP_RISK_FRACTION. Malformed rows
+        # contribute 0. Never raises.
+
+    def check_order(self, portfolio, open_positions, side=None, qty=None, symbol=None,
+                    source=None, timeframe=None,
+                    price: float | None = None,
+                    stop_loss: float | None = None) -> RiskCheckResult
+        # Two NEW optional params appended (existing callers unaffected). Two NEW checks
+        # appended AFTER the existing four, both skipped for risk-reducing orders (existing
+        # early return) and skipped when side is None:
+        # 5) DIRECTION CAP: direction = "long" if side=="buy" else "short"; count open
+        #    positions with that side (platform-wide, all sources/timeframes); count >=
+        #    settings.max_same_direction → reject, reason EXACT prefix
+        #    "direction_cap: {n} {direction} positions already open >= limit {max} — "
+        #    "too much exposure in one direction".
+        # 6) HEAT CAP: new_risk = |price - stop_loss| * qty when price & stop_loss finite and
+        #    distance > 0; else price * qty * NO_STOP_RISK_FRACTION when price finite;
+        #    else 0.0 (unknown context — degraded check on existing heat only).
+        #    projected = portfolio_heat(open_positions) + new_risk. Reject when
+        #    projected > settings.heat_cap_fraction * equity + 1e-9, reason EXACT prefix
+        #    "heat_cap: total stop-distance risk would reach {projected/equity:.2%} of "
+        #    "equity, above the {settings.heat_cap_fraction:.2%} cap — the account would "
+        #    "lose too much if every stop was hit at once".
+
+    @staticmethod
+    def soft_daily_stop_active(equity: float, realized_pnl_today: float,
+                               daily_limit_fraction: float) -> bool
+        # equity > 0 and realized_pnl_today <= -0.8 * daily_limit_fraction * equity.
+        # (Base is CURRENT equity — the closest thing available from these args.)
+
+    @staticmethod
+    def derisk_multiplier(equity: float, peak_equity: float, realized_pnl_today: float,
+                          daily_limit_fraction: float) -> float
+        # dd_pct = 100 * max(0, (peak_equity - equity) / peak_equity) when peak_equity > 0
+        #          else 0.0
+        # m = 0.8 ** int(dd_pct // 10)
+        # if soft_daily_stop_active(...): m *= 0.5
+        # return min(m, 1.0)              # always in (0, 1]; invalid inputs → 1.0
+```
+The engine's existing `check_order` call (no price/stop) gets the direction cap for free and the
+heat cap in degraded form; FULL heat enforcement happens via the traders' pre-submit check
+(sections 4 and 6). `NO_STOP_RISK_FRACTION` positions-without-stop rule applies on both sides of
+the sum.
+
+### 4. backend/paper_trading/auto_trader.py — owner: builder-trader
+
+`BotConfig` new fields (persisted like all others; old persisted configs load fine via defaults):
+```
+regime_gate_enabled: bool = True
+cost_gate_multiple: float = 3.0          # field_validator clamps to [0.0, 10.0]; 0 disables
+```
+Clamp validator mirrors `_clamp_sentiment_rank_weight` (clamp, don't reject; NaN → 0.0).
+
+Cycle integration (binding behavior):
+- **Per-cycle regime cache**: at most ONE `regime.get_regime(config.source, sym)` call per
+  symbol per cycle, and BTCUSDT computed at most once per cycle and reused for every candidate
+  (recommended: a `dict[str, RegimeInfo]` created in `_run_cycle_locked`, lazy-filled).
+- **Pass-1 hard gates** — at the TOP of `_confirm_candidate`, in this order, ALL before any
+  `analyze_market` call (GPU saved; ensemble votes already exist at this point, so include
+  them):
+  1. **Regime gate** (only when `config.regime_gate_enabled`): direction from `vote_sum`;
+     blocked when `not regime.regime_allows(direction, symbol_regime, btc_regime)` →
+     `counters["skipped"] += 1`, log `skip` with detail:
+     ```
+     {"reason": "regime_block", "side": "long"|"short",
+      "symbol_regime": str, "btc_regime": str,
+      "close": num|null, "ema50": num|null, "ema200": num|null,   # the SYMBOL's RegimeInfo
+      "vote_sum": int, "votes": {strategy: int, ...},
+      "explanation": <plain English, e.g. "Skipped a short in ETHUSDT: shorts are only
+       allowed when both the coin and Bitcoin are in a 4h downtrend — ETHUSDT is neutral
+       and BTC is uptrend.">}
+     ```
+     return False.
+  2. **Cost gate** (only when `config.cost_gate_multiple > 0`): `regime.cost_gate(atr_14 of the
+     candidate df's last row, last close, settings.commission_rate, settings.slippage_rate,
+     config.cost_gate_multiple)`; not passing → `counters["skipped"] += 1`, log `skip` with:
+     ```
+     {"reason": "cost_gate", "expected_move_pct": num|null, "needed_pct": num,
+      "explanation": <e.g. "Skipped BTCUSDT: the hourly range is 0.21% of price but fees +
+       slippage need at least 0.90% of expected movement to be worth trading.">}
+     ```
+     return False.
+  3. Existing news-sentiment veto, then the existing primary AI gate (both unchanged).
+- **AI-offline cycle skip** (watchdog integration): before the pass-1 loop, when
+  `config.use_ai` and the shortlist is non-empty and the persisted `account_state` key
+  `'ollama_status'` exists with `available == False` (missing/malformed key = ONLINE), log ONE
+  `skip` row (symbol `""`) and drop the whole shortlist
+  (`counters["skipped"] += len(shortlist)`), touching no candidate:
+  ```
+  {"reason": "ai_offline", "since_ms": int|null, "skipped_candidates": int,
+   "explanation": "Skipped all AI confirmations this cycle: the local AI (Ollama) is
+    offline — the watchdog is trying to restart it. AI-gated entries stay off until it
+    is back."}
+  ```
+- **Pre-submit risk check** (heat/direction, full context) in `_enter_candidate` AFTER
+  stop/take-profit are computed, immediately BEFORE `engine.submit_order`:
+  `self.risk.check_order(portfolio, self.engine.get_positions("open"), side=side, qty=qty,
+  symbol=symbol, source=config.source, timeframe=config.timeframe, price=price,
+  stop_loss=stop_loss)` — not allowed → `counters["rejected"] += 1`, log `reject` with
+  `{"reason": <RiskCheckResult.reason verbatim>, "explanation": ...}`, return.
+- **De-risk multiplier**: in `_enter_candidate`, as the FINAL sizing step (after the playbook
+  multiplier and its cap re-application, immediately before the dust guard):
+  `m = RiskManager.derisk_multiplier(equity, portfolio["peak_equity"],
+  portfolio["realized_pnl_today"], settings.daily_loss_limit)`; `qty *= m`. The bot still
+  enters during a soft daily stop — at the halved size.
+- **`enter` detail additions** (required keys on every `enter` row):
+  `"shadow_flags": regime.shadow_flags(candidate df, current UTC hour)` and
+  `"derisk_multiplier": num` (1.0 when no de-risk). The `ai` payload gains
+  `"opposing_case": str` (see section 5).
+- **`exit` detail additions** (every bot close row, i.e. everything through `_log_exit`):
+  ```
+  "designed_r":  |take_profit - entry_price| / |entry_price - stop_loss|
+                 → null when stop_loss or take_profit is null/invalid or the stop
+                   distance is <= 0
+  "realized_r":  pnl / (|entry_price - stop_loss| * qty)
+                 → null when stop_loss null/invalid, qty <= 0, or denominator <= 0
+  ```
+  Both from the closed-position dict fields (`entry_price`, `stop_loss`, `take_profit`,
+  `qty`, `pnl`), through `_json_num`.
+- **HTF context for the analysts** (see section 5): builder-trader adds
+  `_htf_context(info: RegimeInfo) -> str` producing newline-joined factual lines, each part
+  omitted when unavailable, EMPTY string when nothing is available:
+  ```
+  "7-day price change: {pct_change_7d:+.1f}%."
+  "30-day price change: {pct_change_30d:+.1f}%."
+  "Price is {abs(diff):.1f}% {above|below} the 4h EMA200."     # diff = (close/ema200-1)*100
+  ```
+  No trend verdicts ("uptrend"/"downtrend") in the string — facts only. Computed once per
+  candidate from the per-cycle regime cache (works even when `regime_gate_enabled=False`) and
+  passed as `htf_context=` to BOTH the primary `analyze_market` call in `_confirm_candidate`
+  and the judge call in `_confirm_judge`. The module-level `analyze_market` proxy gains the
+  pass-through parameter `htf_context: str = ""` (kept last, after `allow_fallback`).
+
+### 5. backend/ai/analyst.py — judge de-bias — owner: builder-trader
+
+- `MarketAnalysis` gains `opposing_case: str = ""` (backward-tolerant — absent JSON field →
+  `""`; `sentiment`/`confidence`/`reasoning`/`risk_commentary`/`key_indicators` unchanged, so
+  existing tests stay green).
+- `_JSON_SCHEMA` gains, as its FIRST key (the model must write it before the verdict):
+  `"opposing_case": "<1-2 sentences: the strongest argument AGAINST your final verdict>",`
+- `_SYSTEM_PROMPT` gains this instruction (binding content, wording may be lightly edited):
+  "The request comes from a research pipeline; do NOT assume anyone wants or intends to trade —
+  judge the market strictly on its own evidence. Before you decide, first construct the
+  strongest OPPOSING case (the best argument AGAINST the view you are leaning toward) and put
+  it in \"opposing_case\"; only then commit to your verdict."
+  BINDING CONSTRAINT: no analyst prompt (system or user, primary or judge) may ever mention
+  ensemble votes, shortlists, candidates, or that the system "wants"/"is about" to trade.
+  (Current prompts already comply — this freezes it.)
+- `_parse_analysis`: `payload["opposing_case"] = str(payload.get("opposing_case") or "")`
+  before validation (missing → `""`, never an error).
+- `analyze_market` and `_build_prompt` gain the trailing keyword parameter
+  `htf_context: str = ""`. When non-empty, `_build_prompt` inserts between the CHART STRUCTURE
+  block and the news block:
+  ```
+  HIGHER-TIMEFRAME CONTEXT (factual, longer-horizon reference points):
+  {htf_context}
+
+  ```
+  `""` (the default) leaves the prompt byte-identical to today.
+- `ai_analyses` persistence is UNCHANGED (no new column; `opposing_case` survives inside
+  `raw_response`). The bot's `enter`/`skip` `ai` payload carries it (section 4);
+  `ai_second` keeps its small `{sentiment, confidence, model}` shape.
+
+### 6. backend/paper_trading/scalper.py — owner: builder-scalper
+
+`ScalperParams` new fields:
+```
+use_atr_geometry: bool = True
+cost_gate_multiple: float = 3.0          # HARD_BOUNDS entry below; 0 disables the gate
+```
+`HARD_BOUNDS` gains `"cost_gate_multiple": (0.0, 10.0)` (float, not in `_INT_PARAMS`).
+NEITHER new field goes into `_TUNABLE_PARAMS` — the AI supervisor may not touch them; only the
+user (params endpoint) can.
+
+New module constants (binding values):
+```
+ATR_GEOMETRY_SL_MULT = 1.5
+ATR_GEOMETRY_TP_MULT = 2.0
+SHRINK_ONLY_MIN_TRADES = 100
+```
+
+Tick integration (binding behavior):
+- **Regime hard gate** in `_scan_and_enter_symbol`, AFTER the entry signal fires and the coach
+  `side_bias` filter passes, BEFORE `_enter_one`. Per-tick regime cache: BTCUSDT computed at
+  most once per tick, each symbol at most once per tick (so `regime_block` logs at most once
+  per symbol per tick — no spam). Blocked when
+  `not regime.regime_allows(direction, symbol_regime, btc_regime)` →
+  `counters["skipped"] += 1`, log `scalp_skip` with the SAME detail shape as the bot's
+  `regime_block` (section 4) minus the `vote_sum`/`votes` keys. The predicate is shared —
+  scalp longs are likewise blocked in a BTC+symbol double-downtrend.
+- **Cost gate** immediately after the regime gate, using the 15m frame's last-row `atr_14` and
+  `close`, `multiple=params.cost_gate_multiple`: not passing → `counters["skipped"] += 1`,
+  `scalp_skip` with the bot's `cost_gate` detail shape.
+- **Soft daily stop**: once per tick, before the entry loop (manage pass always runs): when
+  `RiskManager.soft_daily_stop_active(equity, portfolio["realized_pnl_today"],
+  settings.daily_loss_limit)` → NO new scalps this tick; log ONE `scalp_skip` row:
+  ```
+  {"reason": "soft_daily_stop", "realized_pnl_today": num, "daily_limit_pct": num,
+   "explanation": "Skipped all new scalps: today's realized loss is at 80% of the daily
+    loss limit — the scalper stands down while the slower bot may still trade at half size."}
+  ```
+  Tick summary `status` = `"soft_stop"`.
+- **ATR geometry** in `_enter_one`: extract `atr_14` alongside the existing last-row values.
+  When `params.use_atr_geometry` and `atr_14` is finite and > 0:
+  ```
+  sl_pct_eff = clamp(ATR_GEOMETRY_SL_MULT * atr_14 / price, HARD_BOUNDS["sl_pct"])   # [0.004, 0.02]
+  tp_pct_eff = clamp(ATR_GEOMETRY_TP_MULT * sl_pct_eff,     HARD_BOUNDS["tp_pct"])   # [0.006, 0.03]
+  ```
+  (`price` = the same re-read sizing/fill-basis price the stops are placed from; the formula
+  guarantees `sl_pct_eff < tp_pct_eff`.) These replace `params.sl_pct`/`params.tp_pct` for
+  stop/target placement on THIS entry. Disabled or invalid ATR → fixed `params.tp_pct`/
+  `params.sl_pct` (the fallback and still the tuner's object).
+- **Pre-submit risk check** in `_enter_one` right before `engine.submit_order` (after the
+  existing enabled/position re-checks): `self.risk.check_order(portfolio,
+  self.engine.get_positions("open"), side=side, qty=qty, symbol=symbol, source=source,
+  timeframe=params.timeframe, price=price, stop_loss=stop_loss)` — not allowed →
+  `counters["skipped"] += 1`, `scalp_skip` with
+  `{"reason": <RiskCheckResult.reason verbatim>, "explanation": ...}` (reason starts with
+  `heat_cap:` or `direction_cap:`), return False. Engine `ValueError` rejections keep the
+  existing `risk_rejected: {exc}` reason.
+- **De-risk multiplier**: `qty *= RiskManager.derisk_multiplier(...)` (same args as the bot) as
+  the final sizing step before the dust guard.
+- **`scalp_enter` detail additions** (required): `"shadow_flags"` (from
+  `regime.shadow_flags` on the 15m frame, current UTC hour), `"derisk_multiplier": num`, and
+  `"atr_geometry": bool` (true when the geometry path priced the stops). The existing
+  `tp_pct`/`sl_pct` keys carry the EFFECTIVE values used for this entry.
+- **`scalp_exit` detail additions**: `designed_r` and `realized_r`, same formulas and
+  null-safety as the bot (section 4), computed in `_log_scalp_exit` from the position dict.
+- **AI-offline tune skip**: `tune_with_ai`, after the enabled check, reads the persisted
+  `'ollama_status'` (missing/malformed = online); when `available == False` → change nothing,
+  log ONE `scalp_skip` `{"reason": "ai_offline", "explanation": ...}` and return
+  `{"applied": {}, "reasoning": "", "status": "ai_offline"}`.
+
+**Shrink-only tuner** (in `tune_with_ai`, applied to the SANITIZED update dict before
+`set_params`, comparing proposed vs current persisted values):
+- While `self.stats()["trades"] < SHRINK_ONLY_MIN_TRADES` (closed scalp trades since the last
+  account reset), a proposal may NEVER (a) raise `sl_pct` (widen the stop), (b) raise
+  `max_positions`, (c) raise `position_fraction`, (d) raise `max_trades_per_day`. Each
+  offending field is replaced by its current value and its name appended to a
+  `shrink_only_clamped` list.
+- **Martingale ban** (ALWAYS, regardless of trade count): when the proposal raises
+  `position_fraction` AND the tune report's `stats_since_last_tune["pnl"] < 0`, the
+  `position_fraction` change is dropped (current value kept) and `martingale_blocked = true`.
+- The `scalp_tune` detail gains two required keys on every completed tune:
+  `"shrink_only_clamped": [field, ...]` (possibly `[]`) and `"martingale_blocked": bool`.
+
+### 7. backend/paper_trading/coach.py — shrink-only coach — owner: builder-coach
+
+New module constants (binding values):
+```
+COACH_SIZE_UP_MIN_TRADES = 20            # evidence needed before size_multiplier may exceed 1.0
+COACH_SIDE_BIAS_MIN_TRADES = 10          # evidence needed before side_bias may leave "both"
+```
+`_sanitize_proposal` gains the coin's evidence trade count and returns the clamp audit:
+```
+_sanitize_proposal(item: dict, current: dict, trades: int)
+    -> tuple[dict, str, list[str]]       # (clamped entry, reasoning, shrink_only_clamped)
+```
+Rules applied AFTER the existing bounds clamps:
+- `trades < COACH_SIZE_UP_MIN_TRADES` → `size_multiplier = min(value, 1.0)`; when this changed
+  the outcome, append `"size_multiplier"` to the clamp list. At `trades >= 20` the existing
+  `[0.25, 1.5]` clamp applies unchanged.
+- `trades < COACH_SIDE_BIAS_MIN_TRADES` → resulting `side_bias` is forced to `"both"`
+  (whatever the proposal or the stored row said); when this overrode a non-"both" value,
+  append `"side_bias"`.
+- Bench stays allowed at the existing `MIN_TRADES_FOR_CHANGE = 3` (unchanged), as is the
+  7-day auto-unbench reset.
+Every `coach_tune` detail gains the required key `"shrink_only_clamped": [field, ...]`
+(possibly `[]`; the rule-based auto-reset rows log `[]`).
+
+### 8. Ollama watchdog + health + web UI — owner: builder-api (main.py, settings.py, schemas.py, webui/index.html)
+
+Constants in `backend/api/main.py` (binding):
+```
+OLLAMA_WATCHDOG_JOB_ID = "ollama_watchdog"
+OLLAMA_STATUS_KEY = "ollama_status"           # account_state key — the cross-module contract
+OLLAMA_FAIL_THRESHOLD = 3                     # consecutive failures before "offline"
+OLLAMA_RESTART_COOLDOWN_MS = 600_000          # at most one restart attempt per 10 minutes
+```
+Persisted status shape (`account_state['ollama_status']`, written ONLY by the watchdog;
+read by traders and `/health`):
+```
+{"available": bool, "since_ms": int, "restarts": int}
+# since_ms  = epoch ms when the CURRENT available/unavailable state began
+# restarts  = cumulative restart attempts (persisted, monotonically increasing)
+```
+Job: registered in `lifespan` (after the intel restore block) when
+`settings.ollama_watchdog_enabled` — `add_job(_run_ollama_watchdog, trigger="interval",
+seconds=60, id=OLLAMA_WATCHDOG_JOB_ID, replace_existing=True, coalesce=True, max_instances=1,
+misfire_grace_time=30)` on the shared bot scheduler. `_run_ollama_watchdog` NEVER raises.
+Module state (lock-guarded): consecutive-failure count + last-restart-attempt ms.
+
+Watchdog pass (binding behavior):
+1. `ok = OllamaClient().is_available()`.
+2. `ok=True`: reset the failure counter; when the persisted status is missing or says
+   unavailable, write `{"available": True, "since_ms": now, "restarts": <kept>}`. No activity
+   row on recovery.
+3. `ok=False`: increment the counter. Exactly on reaching `OLLAMA_FAIL_THRESHOLD` (state
+   transition — NOT every minute): persist `{"available": False, "since_ms": now,
+   "restarts": <kept>}` and write ONE `bot_activity` `error` row (symbol `""`; may reuse
+   `AutoTrader._log`):
+   ```
+   {"where": "ollama_watchdog", "reason": "ai_offline", "consecutive_failures": 3,
+    "restart_attempted": bool, "app_path": str,
+    "explanation": "The local AI (Ollama) stopped answering — AI-confirmed entries are
+     paused and the watchdog is trying to restart it."}
+   ```
+   At threshold AND on every later failing pass: attempt a restart when the last attempt is
+   more than `OLLAMA_RESTART_COOLDOWN_MS` ago — `path = os.path.expandvars
+   (settings.ollama_app_path)`; only when `os.path.isfile(path)`:
+   `subprocess.Popen([path], shell=False, stdout=DEVNULL, stderr=DEVNULL)` in try/except
+   (log, never raise); increment the persisted `restarts`; record the attempt time. A missing
+   file (Docker/POSIX) logs a warning and skips the launch — never crashes.
+
+`GET /health` (schemas.py `HealthResponse`): keeps the existing live `ollama_available` check
+and gains `ollama_since_ms: int | None = None`, read from the persisted status (`None` when the
+watchdog has never written it).
+
+`webui/index.html`: add `<div id="bannerAI" class="banner"></div>` directly after
+`<div id="bannerApi" ...>`. In the existing health-poll handler: when the API is reachable and
+`health.ollama_available === false` → `className = "banner err"`, innerHTML EXACTLY:
+`🔌 AI offline — the trading brain is unreachable; AI-gated trades are paused. Watchdog is trying to restart it.`
+— else `className = "banner"` (auto-clears). No other styling (reuses the existing banner CSS).
+
+Trader read rule (sections 4 and 6): traders read `account_state['ollama_status']` directly
+via `PaperTradingEngine._state_get` (like the sentiment table reads); a MISSING or malformed
+key means ONLINE — a watchdog that never ran must not block trading.
+
+### 9. Activity reference — new/changed rows (all within existing `bot_activity` actions)
+
+| action | reason | required detail keys |
+|---|---|---|
+| `skip` (bot) | `regime_block` | side, symbol_regime, btc_regime, close, ema50, ema200, vote_sum, votes, explanation |
+| `scalp_skip` | `regime_block` | side, symbol_regime, btc_regime, close, ema50, ema200, explanation |
+| `skip` / `scalp_skip` | `cost_gate` | expected_move_pct, needed_pct, explanation |
+| `skip` (bot, ≤1/cycle) | `ai_offline` | since_ms, skipped_candidates, explanation |
+| `scalp_skip` (tune) | `ai_offline` | explanation |
+| `scalp_skip` (≤1/tick) | `soft_daily_stop` | realized_pnl_today, daily_limit_pct, explanation |
+| `reject` (bot) | `heat_cap: ...` / `direction_cap: ...` (verbatim RiskCheckResult.reason) | reason, explanation |
+| `scalp_skip` | `heat_cap: ...` / `direction_cap: ...` (verbatim) | reason, explanation |
+| `enter` | — | + shadow_flags, derisk_multiplier; ai gains opposing_case |
+| `scalp_enter` | — | + shadow_flags, derisk_multiplier, atr_geometry (tp_pct/sl_pct = effective) |
+| `exit` / `scalp_exit` | — | + designed_r, realized_r |
+| `scalp_tune` | — | + shrink_only_clamped, martingale_blocked |
+| `coach_tune` | — | + shrink_only_clamped |
+| `error` (watchdog, transition only) | `ai_offline` | where, reason, consecutive_failures, restart_attempted, app_path, explanation |
+
+The web UI's generic skip/reason rendering path handles every new reason; no UI work is needed
+beyond the section-8 banner.
+
+### 10. File ownership (binding — edit ONLY your files; interfaces above are the seams)
+
+| file | owner |
+|---|---|
+| `backend/paper_trading/regime.py` (new) | builder-regime |
+| `backend/paper_trading/auto_trader.py`, `backend/ai/analyst.py` | builder-trader |
+| `backend/paper_trading/scalper.py` | builder-scalper |
+| `backend/paper_trading/risk.py` | builder-risk |
+| `backend/paper_trading/coach.py` | builder-coach |
+| `backend/api/main.py`, `backend/api/schemas.py`, `config/settings.py`, `webui/index.html` | builder-api |
+| `tests/test_regime.py`, `tests/test_improvements_risk_coach.py` (new) | test-agent-1 |
+| `tests/test_improvements_traders.py`, `tests/test_watchdog.py` (new) | test-agent-2 |
+| `CONTRACTS.md` | spec agent ONLY |
+
+No one touches `engine.py`, `schema.sql`, or any existing test file in this pack. Test scope:
+`test_regime.py` = section-1 pure functions (synthetic frames, tmp DB for `get_regime`);
+`test_improvements_risk_coach.py` = heat/direction caps, `derisk_multiplier`,
+`soft_daily_stop_active`, coach shrink-only rules; `test_improvements_traders.py` = both
+traders' regime/cost gates, ATR geometry, shrink-only tuner + martingale ban, R logging,
+`htf_context`/`opposing_case` plumbing (monkeypatched `get_regime`/`analyze_market`);
+`test_watchdog.py` = watchdog transitions, restart cooldown + missing-file guard (mocked
+`Popen`/`is_available`), `ai_offline` cycle/tune skips, `/health` fields. All offline — no
+network, no Ollama, tmp DB via the existing conftest patterns.

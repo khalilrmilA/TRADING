@@ -167,6 +167,12 @@ def _configure(trader: AutoTrader, **overrides: Any) -> BotConfig:
         "use_second_judge": False,
         "min_vote": 2,
         "allow_short": False,
+        # This module tests the pre-v3 entry pipeline; the Improvement Pack
+        # v3 cost gate is disabled via its contract knob (0 disables) — the
+        # low-ATR fixtures here would otherwise be cost-gated before the
+        # behaviors under test run. The v3 gates have their own binding
+        # suite in tests/test_improvements_traders.py.
+        "cost_gate_multiple": 0.0,
     }
     updates.update(overrides)
     return trader.set_config(updates)

@@ -123,6 +123,34 @@ class BotConfigUpdate(BaseModel):
     min_vote: int | None = Field(None, ge=1, le=4)
     max_position_fraction: float | None = Field(None, gt=0.0, le=1.0)
     running: bool | None = None
+    regime_gate_enabled: bool | None = Field(
+        None,
+        description=(
+            "Improvement Pack v3 market-regime hard gate (shorts only in a "
+            "coin+BTC 4h double-downtrend, longs blocked in that same state)."
+        ),
+    )
+    cost_gate_multiple: float | None = Field(
+        None,
+        description=(
+            "Improvement Pack v3 entry cost gate: expected per-bar move "
+            "(ATR/price) must cover this multiple of the round-trip "
+            "fee+slippage cost. 0 disables. Deliberately NOT range-checked "
+            "here — BotConfig clamps it to [0, 10] instead of rejecting."
+        ),
+    )
+    use_second_judge: bool | None = Field(
+        None, description="Require the finance-specialist second judge to agree before entering."
+    )
+    second_judge_model: str | None = Field(None, min_length=1)
+    judge_min_confidence: int | None = Field(None, ge=0, le=100)
+    sentiment_rank_weight: float | None = Field(
+        None,
+        description=(
+            "News-sentiment weight in candidate RANKING (never qualifies a "
+            "trade). Not range-checked here — BotConfig clamps to [0, 2]."
+        ),
+    )
 
 
 class ScalperParamsUpdate(BaseModel):
@@ -154,6 +182,23 @@ class ScalperParamsUpdate(BaseModel):
     disabled_symbols: list[str] | None = Field(
         None, description="Symbols the scalper must not trade (full replacement list)."
     )
+    use_atr_geometry: bool | None = Field(
+        None,
+        description=(
+            "Improvement Pack v3 ATR stop geometry (TP/SL scaled off the last "
+            "closed candle's ATR). USER-ONLY knob: this endpoint is the only "
+            "sanctioned mutation path — the AI tuner may never touch it."
+        ),
+    )
+    cost_gate_multiple: float | None = Field(
+        None,
+        description=(
+            "Improvement Pack v3 entry cost gate: the 15m ATR must cover this "
+            "multiple of the round-trip fee+slippage cost. 0 disables. "
+            "USER-ONLY knob (not AI-tunable); clamped to HARD_BOUNDS [0, 10] "
+            "by set_params."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +213,14 @@ class HealthResponse(BaseModel):
     ollama_available: bool = False
     db: str = "ok"
     paper_only: bool = True
+    ollama_since_ms: int | None = Field(
+        None,
+        description=(
+            "Epoch ms (UTC) when Ollama's current available/unavailable state "
+            "began, from the watchdog's persisted status; null when the "
+            "watchdog has never written it."
+        ),
+    )
 
 
 class ConfiguredModels(BaseModel):

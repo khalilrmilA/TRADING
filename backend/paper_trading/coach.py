@@ -21,6 +21,13 @@ Safety rules (all contract-mandated):
   changes (not enough evidence) — except that a coin benched for more than
   :data:`BENCH_RESET_DAYS` days is reset to defaults so it can earn its way
   back into the rotation;
+* SHRINK-ONLY evidence gates (Improvement Pack v3): below
+  :data:`COACH_SIZE_UP_MIN_TRADES` closed trades ``size_multiplier`` is
+  capped at 1.0 (the coach may shrink a coin but not size it up), and below
+  :data:`COACH_SIDE_BIAS_MIN_TRADES` closed trades ``side_bias`` is forced
+  back to ``both`` whatever the proposal or the stored row said; every
+  override is recorded in the ``coach_tune`` detail under
+  ``shrink_only_clamped``;
 * an LLM failure (Ollama error, unusable JSON) changes NOTHING;
 * every applied change writes a ``coach_tune`` row to ``bot_activity`` with
   the full before/after playbook and the model's reasoning.
@@ -73,6 +80,10 @@ SIDE_BIASES: tuple[str, ...] = ("both", "long_only", "short_only")
 MIN_TRADES_FOR_CHANGE = 3
 #: A benched coin with too few trades is reset to defaults after this long.
 BENCH_RESET_DAYS = 7
+#: Evidence needed before ``size_multiplier`` may exceed 1.0 (shrink-only).
+COACH_SIZE_UP_MIN_TRADES = 20
+#: Evidence needed before ``side_bias`` may leave ``"both"`` (shrink-only).
+COACH_SIDE_BIAS_MIN_TRADES = 10
 
 #: Closed trades per coin fed to the LLM (most recent first).
 _TRADES_PER_COIN = 20
@@ -402,7 +413,10 @@ class Coach:
                 if proposal is None:
                     counters["unchanged"] += 1
                     continue
-                new_entry, reasoning = self._sanitize_proposal(proposal, current)
+                coin = evidence.get(symbol) or self._empty_evidence(symbol)
+                new_entry, reasoning, shrink_clamped = self._sanitize_proposal(
+                    proposal, current, int(coin["trades"])
+                )
                 if all(new_entry[f] == current.get(f) for f in _TUNABLE_FIELDS):
                     counters["unchanged"] += 1
                     continue
@@ -412,8 +426,9 @@ class Coach:
                         current,
                         new_entry,
                         reasoning,
-                        evidence.get(symbol) or self._empty_evidence(symbol),
+                        coin,
                         model=model,
+                        shrink_only_clamped=shrink_clamped,
                     )
                 except sqlite3.Error as exc:
                     counters["errors"] += 1
@@ -675,7 +690,11 @@ class Coach:
             "- size_multiplier below 1.0 de-risks a shaky coin; above 1.0 "
             "only for consistent winners.\n"
             "- min_vote_override raises the entry bar for a coin (more "
-            "strategy agreement required); null keeps the bot's default.\n\n"
+            "strategy agreement required); null keeps the bot's default.\n"
+            "- Evidence gates (enforced): size_multiplier above 1.0 needs at "
+            f"least {COACH_SIZE_UP_MIN_TRADES} closed trades and a side_bias "
+            f"other than 'both' needs at least {COACH_SIDE_BIAS_MIN_TRADES}; "
+            "under-evidenced proposals are clamped back.\n\n"
             f"HARD BOUNDS (out-of-range values are clamped): "
             f"{_playbook_bounds_text()}\n\n"
             "Respond ONLY with JSON exactly in this shape, including EVERY "
@@ -727,19 +746,31 @@ class Coach:
 
     @staticmethod
     def _sanitize_proposal(
-        item: dict[str, Any], current: dict[str, Any]
-    ) -> tuple[dict[str, Any], str]:
+        item: dict[str, Any], current: dict[str, Any], trades: int
+    ) -> tuple[dict[str, Any], str, list[str]]:
         """Clamp one raw LLM proposal against the coin's current playbook.
 
         Fields the model omitted keep their current values; an explicit
         ``min_vote_override: null`` clears the override.
 
+        AFTER the bounds clamps, the shrink-only evidence gates apply
+        (contract, Improvement Pack v3): with fewer than
+        :data:`COACH_SIZE_UP_MIN_TRADES` closed trades the resulting
+        ``size_multiplier`` is capped at 1.0, and with fewer than
+        :data:`COACH_SIDE_BIAS_MIN_TRADES` closed trades the resulting
+        ``side_bias`` is forced to ``"both"`` — whatever the proposal or the
+        stored row said. Benching needs no extra evidence beyond the
+        :data:`MIN_TRADES_FOR_CHANGE` review gate.
+
         Args:
             item: Raw proposal dict from the model.
             current: The coin's current (clamped) playbook entry.
+            trades: The coin's closed-trade evidence count.
 
         Returns:
-            ``(clamped entry dict, reasoning string)``.
+            ``(clamped entry dict, reasoning string, shrink_only_clamped)``
+            where ``shrink_only_clamped`` lists the fields the evidence
+            gates overrode (possibly empty).
         """
         cur_bench = bool(current.get("bench"))
         cur_bias = _clamp_side_bias(current.get("side_bias"), "both")
@@ -759,8 +790,18 @@ class Coach:
             ),
             "min_vote_override": new_vote,
         }
+
+        # Shrink-only evidence gates — applied after the bounds clamps.
+        shrink_only_clamped: list[str] = []
+        if trades < COACH_SIZE_UP_MIN_TRADES and new_entry["size_multiplier"] > 1.0:
+            new_entry["size_multiplier"] = 1.0
+            shrink_only_clamped.append("size_multiplier")
+        if trades < COACH_SIDE_BIAS_MIN_TRADES and new_entry["side_bias"] != "both":
+            new_entry["side_bias"] = "both"
+            shrink_only_clamped.append("side_bias")
+
         reasoning = str(item.get("reasoning") or "")[:_MAX_REASONING_CHARS]
-        return new_entry, reasoning
+        return new_entry, reasoning, shrink_only_clamped
 
     # ------------------------------------------------------------------ #
     # Persistence & logging                                                #
@@ -774,6 +815,7 @@ class Coach:
         reasoning: str,
         stats: dict[str, Any],
         model: str,
+        shrink_only_clamped: list[str] | None = None,
     ) -> None:
         """Persist one playbook change and log the mandated ``coach_tune`` row.
 
@@ -784,7 +826,11 @@ class Coach:
             reasoning: The model's (or auto-reset) reasoning text.
             stats: Evidence snapshot stored alongside the row.
             model: Model name (empty string for rule-based auto-resets).
+            shrink_only_clamped: Fields the shrink-only evidence gates
+                overrode (``None``/omitted → ``[]``, e.g. for the
+                rule-based auto-reset rows).
         """
+        clamped_fields = list(shrink_only_clamped or [])
         after = _clamped_entry(after)  # belt & braces on the write path
         before_public = {field: before.get(field) for field in _TUNABLE_FIELDS}
         after_public = {field: after.get(field) for field in _TUNABLE_FIELDS}
@@ -810,6 +856,13 @@ class Coach:
             for field in _TUNABLE_FIELDS
             if before_public.get(field) != after_public[field]
         )
+        clamp_txt = ""
+        if clamped_fields:
+            clamp_txt = (
+                f" Shrink-only rule kept {' and '.join(clamped_fields)} "
+                "conservative: not enough closed trades yet for this coin to "
+                "size up or pick one trading side."
+            )
         self._log(
             "coach_tune",
             symbol=symbol,
@@ -819,8 +872,10 @@ class Coach:
                 "after": after_public,
                 "reasoning": reasoning,
                 "model": model,
+                "shrink_only_clamped": clamped_fields,
                 "explanation": (
                     f"Coach re-tuned {symbol} ({changes_txt or 'no field changes'})."
+                    f"{clamp_txt}"
                 ),
             },
         )

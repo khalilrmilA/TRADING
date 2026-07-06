@@ -186,6 +186,12 @@ def _configure(trader: AutoTrader, **overrides: Any) -> BotConfig:
         "use_second_judge": True,
         "second_judge_model": DEFAULT_JUDGE_MODEL,
         "judge_min_confidence": 55,
+        # This module tests the judge pipeline; the Improvement Pack v3 cost
+        # gate is disabled via its contract knob (0 disables) — the low-ATR
+        # fixtures here would otherwise be cost-gated before any AI call.
+        # The v3 gates have their own binding suite in
+        # tests/test_improvements_traders.py.
+        "cost_gate_multiple": 0.0,
     }
     updates.update(overrides)
     return trader.set_config(updates)

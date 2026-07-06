@@ -45,7 +45,9 @@ from backend.ai.ollama_client import OllamaClient, OllamaError
 from backend.data import service as _data_service
 from backend.database.db import get_conn, init_db, load_ohlcv, utc_now_ms
 from backend.indicators.features import feature_summary
+from backend.paper_trading import regime
 from backend.paper_trading.engine import PaperTradingEngine
+from backend.paper_trading.risk import RiskManager
 from backend.strategies.voting import VotingStrategy
 from config.settings import settings
 
@@ -55,6 +57,14 @@ logger = logging.getLogger(__name__)
 _CONFIG_KEY = "bot_config"
 _LAST_CYCLE_TS_KEY = "bot_last_cycle_ts"
 _LAST_CYCLE_SUMMARY_KEY = "bot_last_cycle_summary"
+#: account_state key written by the API's Ollama watchdog (cross-module
+#: contract). A MISSING or malformed key means ONLINE — a watchdog that never
+#: ran must not block trading.
+_OLLAMA_STATUS_KEY = "ollama_status"
+
+#: The market-regime reference symbol: BTC leads the whole crypto market, so
+#: the regime hard gate reads BTCUSDT alongside the candidate's own regime.
+_REGIME_REFERENCE_SYMBOL = "BTCUSDT"
 
 #: Minimum candles required before a symbol can be scanned/managed.
 _MIN_SCAN_ROWS = 100
@@ -113,6 +123,7 @@ def analyze_market(
     model: str | None = None,
     news_context: dict[str, Any] | None = None,
     allow_fallback: bool = True,
+    htf_context: str = "",
 ) -> MarketAnalysis:
     """Proxy to :func:`backend.ai.analyst.analyze_market` (test patch point)."""
     return _analyst_module.analyze_market(
@@ -122,6 +133,7 @@ def analyze_market(
         model=model,
         news_context=news_context,
         allow_fallback=allow_fallback,
+        htf_context=htf_context,
     )
 
 
@@ -259,6 +271,90 @@ def _is_stale(df: pd.DataFrame, timeframe: str) -> bool:
     return age > (2 * _timeframe_delta(timeframe) + _STALE_GRACE)
 
 
+def _finite(value: Any) -> float | None:
+    """Coerce to a finite float, or None (no rounding — for internal math)."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _r_multiples(position: dict[str, Any]) -> tuple[float | None, float | None]:
+    """R-multiple diagnostics for a closed position (contract v3).
+
+    ``designed_r`` is the reward-to-risk ratio the entry was PLACED with
+    (``|take_profit - entry| / |entry - stop_loss|``); ``realized_r`` is the
+    actual outcome in units of the risked stop distance
+    (``pnl / (|entry - stop_loss| * qty)``). Together they answer "was the
+    trade designed well, and how much of the designed risk did it actually
+    win or lose?".
+
+    Args:
+        position: Closed-position dict (engine shape) with ``entry_price``,
+            ``stop_loss``, ``take_profit``, ``qty`` and ``pnl`` fields.
+
+    Returns:
+        ``(designed_r, realized_r)`` — each ``None`` when its inputs are
+        missing/invalid or the stop distance is not positive.
+    """
+    entry = _finite(position.get("entry_price"))
+    stop = _finite(position.get("stop_loss"))
+    take = _finite(position.get("take_profit"))
+    qty = _finite(position.get("qty"))
+    pnl = _finite(position.get("pnl"))
+
+    designed: float | None = None
+    realized: float | None = None
+    if entry is None or stop is None:
+        return designed, realized
+    stop_distance = abs(entry - stop)
+    if stop_distance <= 0:
+        return designed, realized
+    if take is not None:
+        designed = abs(take - entry) / stop_distance
+    if qty is not None and qty > 0 and pnl is not None:
+        denominator = stop_distance * qty
+        if denominator > 0:
+            realized = pnl / denominator
+    return designed, realized
+
+
+def _htf_context(info: regime.RegimeInfo) -> str:
+    """Factual higher-timeframe context lines for the analyst prompt.
+
+    Produces newline-joined FACT lines (multi-day price changes and the
+    distance to the 4h EMA200) from a :class:`~backend.paper_trading.regime.
+    RegimeInfo`. Deliberately contains NO trend verdicts ("uptrend"/
+    "downtrend") — the analyst must judge the market on raw evidence, not on
+    this module's regime classification (contract de-bias rule). Each part is
+    omitted when unavailable; an empty string means "no context" and leaves
+    the analyst prompt unchanged.
+
+    Args:
+        info: Regime snapshot for the candidate's symbol.
+
+    Returns:
+        Newline-joined factual lines, or ``""`` when nothing is available.
+    """
+    lines: list[str] = []
+    pct_7d = _finite(getattr(info, "pct_change_7d", None))
+    if pct_7d is not None:
+        lines.append(f"7-day price change: {pct_7d:+.1f}%.")
+    pct_30d = _finite(getattr(info, "pct_change_30d", None))
+    if pct_30d is not None:
+        lines.append(f"30-day price change: {pct_30d:+.1f}%.")
+    close = _finite(getattr(info, "close", None))
+    ema200 = _finite(getattr(info, "ema200", None))
+    if close is not None and ema200 is not None and ema200 > 0:
+        diff = (close / ema200 - 1.0) * 100.0
+        side = "above" if diff >= 0 else "below"
+        lines.append(f"Price is {abs(diff):.1f}% {side} the 4h EMA200.")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Configuration model
 # ---------------------------------------------------------------------------
@@ -297,6 +393,15 @@ class BotConfig(BaseModel):
             shortlist ranking (clamped to [0.0, 2.0] on every update; 0
             disables the bonus). News only reorders qualified candidates —
             it never qualifies one.
+        regime_gate_enabled: When True, every candidate passes the market-
+            regime hard gate BEFORE any AI call: shorts are allowed only
+            when both the coin and BTCUSDT are in a 4h downtrend, and longs
+            are blocked in exactly that double-downtrend state
+            (``regime.regime_allows``).
+        cost_gate_multiple: The expected per-bar move (ATR/price) must be at
+            least this multiple of the round-trip fee+slippage cost or the
+            candidate is skipped before any AI call. Clamped to [0.0, 10.0]
+            on every update; 0 disables the gate.
     """
 
     watchlist: list[str] = Field(default_factory=lambda: list(_DEFAULT_WATCHLIST))
@@ -314,6 +419,8 @@ class BotConfig(BaseModel):
     second_judge_model: str = "mychen76/Fin-R1:Q5"
     judge_min_confidence: int = Field(55, ge=0, le=100)
     sentiment_rank_weight: float = 0.5
+    regime_gate_enabled: bool = True
+    cost_gate_multiple: float = 3.0
 
     @field_validator("sentiment_rank_weight")
     @classmethod
@@ -326,6 +433,17 @@ class BotConfig(BaseModel):
         +inf → 2.0).
         """
         return min(2.0, max(0.0, float(value)))
+
+    @field_validator("cost_gate_multiple")
+    @classmethod
+    def _clamp_cost_gate_multiple(cls, value: float) -> float:
+        """Clamp the cost-gate multiple to the contract range [0.0, 10.0].
+
+        Mirrors ``_clamp_sentiment_rank_weight``: clamp instead of reject,
+        so ``set_config`` and persisted-value loads both sanitise. Non-finite
+        input degrades safely (NaN → 0.0, +inf → 10.0); 0 disables the gate.
+        """
+        return min(10.0, max(0.0, float(value)))
 
     @field_validator("watchlist")
     @classmethod
@@ -633,6 +751,36 @@ class AutoTrader:
         # --- 5) shortlist & rank ----------------------------------------------
         shortlist = self._shortlist(config, candidates, playbook)
 
+        # AI-offline cycle skip (watchdog integration): when the persisted
+        # watchdog status says Ollama is down, drop the whole shortlist with
+        # ONE skip row instead of timing out per candidate. A missing or
+        # malformed status key means ONLINE (a watchdog that never ran must
+        # not block trading).
+        if config.use_ai and shortlist:
+            offline, since_ms = self._ollama_offline()
+            if offline:
+                counters["skipped"] += len(shortlist)
+                self._log(
+                    "skip",
+                    detail={
+                        "reason": "ai_offline",
+                        "since_ms": since_ms,
+                        "skipped_candidates": len(shortlist),
+                        "explanation": (
+                            "Skipped all AI confirmations this cycle: the local "
+                            "AI (Ollama) is offline — the watchdog is trying to "
+                            "restart it. AI-gated entries stay off until it is "
+                            "back."
+                        ),
+                    },
+                )
+                shortlist = []
+
+        # Per-cycle regime cache: at most ONE regime.get_regime call per
+        # symbol per cycle; BTCUSDT is computed at most once and reused for
+        # every candidate (contract).
+        regime_cache: dict[str, regime.RegimeInfo] = {}
+
         # --- 6) AI confirmation gate + entries ---------------------------------
         # TWO PASSES (contract, GPU model-swap thrash avoidance): first the
         # primary gate for ALL candidates (the primary model stays loaded),
@@ -645,7 +793,7 @@ class AutoTrader:
                 halted = True
                 break
             try:
-                if self._confirm_candidate(config, candidate, counters):
+                if self._confirm_candidate(config, candidate, counters, regime_cache):
                     survivors.append(candidate)
             except Exception as exc:  # noqa: BLE001 — per-candidate isolation
                 counters["errors"] += 1
@@ -840,6 +988,61 @@ class AutoTrader:
         except Exception:  # noqa: BLE001 — the playbook is an optional layer
             logger.exception("Coach playbook unavailable — trading without it")
             return {}
+
+    def _ollama_offline(self) -> tuple[bool, int | None]:
+        """Read the watchdog's persisted Ollama status. Never raises.
+
+        The API's watchdog job writes ``account_state['ollama_status']``
+        (``{"available": bool, "since_ms": int, "restarts": int}``). Contract
+        read rule: a MISSING or malformed key means ONLINE — a watchdog that
+        never ran must not block trading.
+
+        Returns:
+            ``(offline, since_ms)`` — ``offline`` is True only when the
+            status exists and explicitly says ``available == False``;
+            ``since_ms`` is when that state began (None when unknown).
+        """
+        try:
+            with self._connect() as conn:
+                status = self.engine._state_get(conn, _OLLAMA_STATUS_KEY, None)
+        except Exception:  # noqa: BLE001 — a broken status read = online
+            logger.exception("Could not read the Ollama watchdog status")
+            return False, None
+        if not isinstance(status, dict) or status.get("available") is not False:
+            return False, None
+        try:
+            raw_since = status.get("since_ms")
+            since_ms = int(raw_since) if raw_since is not None else None
+        except (TypeError, ValueError):
+            since_ms = None
+        return True, since_ms
+
+    def _regime_cached(
+        self,
+        config: BotConfig,
+        symbol: str,
+        cache: dict[str, regime.RegimeInfo],
+    ) -> regime.RegimeInfo:
+        """Per-cycle cached market-regime lookup (contract: one call/symbol).
+
+        ``regime.get_regime`` reads cached candles only and never raises; the
+        cache guarantees at most one computation per symbol per cycle (and
+        therefore BTCUSDT at most once per cycle, reused for every
+        candidate).
+
+        Args:
+            config: Active bot configuration (supplies the data source).
+            symbol: Symbol whose 4h regime is wanted.
+            cache: The cycle's regime cache, mutated in place.
+
+        Returns:
+            The (possibly cached) :class:`~backend.paper_trading.regime.RegimeInfo`.
+        """
+        info = cache.get(symbol)
+        if info is None:
+            info = regime.get_regime(config.source, symbol)
+            cache[symbol] = info
+        return info
 
     def _fresh_sentiment(self, symbol: str) -> dict[str, Any] | None:
         """Latest FRESH news-sentiment row for ``symbol``. Never raises.
@@ -1157,8 +1360,20 @@ class AutoTrader:
         config: BotConfig,
         candidate: dict[str, Any],
         counters: dict[str, int],
+        regime_cache: dict[str, regime.RegimeInfo] | None = None,
     ) -> bool:
-        """Entry pass 1 (contract step 6): sentiment veto + primary AI gate.
+        """Entry pass 1 (contract step 6): hard gates + primary AI gate.
+
+        Gate order (contract v3 — the cheap hard gates run BEFORE any LLM
+        call, saving GPU time):
+
+        1. REGIME gate (when ``regime_gate_enabled``): the shared
+           ``regime.regime_allows`` predicate — shorts only in a coin+BTC 4h
+           double-downtrend, longs blocked in exactly that state.
+        2. COST gate (when ``cost_gate_multiple > 0``): the expected per-bar
+           move (ATR/price) must cover ``cost_gate_multiple`` × the
+           round-trip fee+slippage cost.
+        3. News-sentiment veto, then the primary AI gate (both unchanged).
 
         Intel integration: a FRESH (< 3h) news-sentiment score at/below -50
         blocks a long (skip ``news_negative``) and at/above +50 blocks a
@@ -1169,24 +1384,115 @@ class AutoTrader:
 
         Side effects on ``candidate`` (consumed by the judge/entry passes):
         ``ai`` (primary transparency payload, None when ``use_ai`` is off),
-        ``ai_second`` (initialised to None) and ``news_context``.
+        ``ai_second`` (initialised to None), ``news_context`` and
+        ``htf_context`` (factual higher-timeframe lines for both analyst
+        calls, built from the per-cycle regime cache even when the regime
+        gate is disabled).
 
         Args:
             config: Active bot configuration.
             candidate: Shortlisted candidate dict from :meth:`_scan_symbol`.
             counters: Cycle counters, mutated in place.
+            regime_cache: The cycle's shared regime cache (None → private
+                one-off cache, keeping direct calls working).
 
         Returns:
             True when the candidate survives to the second-judge/entry pass.
         """
         symbol: str = candidate["symbol"]
         df: pd.DataFrame = candidate["df"]
-        direction = "long" if candidate["vote_sum"] > 0 else "short"
+        vote_sum: int = candidate["vote_sum"]
+        direction = "long" if vote_sum > 0 else "short"
         candidate["ai"] = None
         candidate["ai_second"] = None
         candidate["news_context"] = None
+        if regime_cache is None:
+            regime_cache = {}
 
-        # News-sentiment gate: strongly negative fresh news blocks longs,
+        # Higher-timeframe context for BOTH analyst calls — factual lines
+        # only, computed once per candidate from the per-cycle regime cache
+        # (works even when the regime gate is disabled).
+        symbol_info = self._regime_cached(config, symbol, regime_cache)
+        candidate["htf_context"] = _htf_context(symbol_info)
+
+        # 1) REGIME hard gate — above the ensemble result, before any AI call.
+        if config.regime_gate_enabled:
+            btc_info = self._regime_cached(
+                config, _REGIME_REFERENCE_SYMBOL, regime_cache
+            )
+            if not regime.regime_allows(
+                direction, symbol_info.regime, btc_info.regime
+            ):
+                counters["skipped"] += 1
+                if direction == "short":
+                    explanation = (
+                        f"Skipped a short in {symbol}: shorts are only allowed "
+                        "when both the coin and Bitcoin are in a 4h downtrend "
+                        f"— {symbol} is {symbol_info.regime} and BTC is "
+                        f"{btc_info.regime}."
+                    )
+                else:
+                    explanation = (
+                        f"Skipped a long in {symbol}: longs are blocked while "
+                        "both the coin and Bitcoin are in a 4h downtrend — "
+                        f"{symbol} is {symbol_info.regime} and BTC is "
+                        f"{btc_info.regime}."
+                    )
+                self._log(
+                    "skip",
+                    symbol=symbol,
+                    detail={
+                        "reason": "regime_block",
+                        "side": direction,
+                        "symbol_regime": symbol_info.regime,
+                        "btc_regime": btc_info.regime,
+                        "close": _json_num(symbol_info.close),
+                        "ema50": _json_num(symbol_info.ema50),
+                        "ema200": _json_num(symbol_info.ema200),
+                        "vote_sum": vote_sum,
+                        "votes": candidate["votes"],
+                        "explanation": explanation,
+                    },
+                )
+                return False
+
+        # 2) COST gate — the expected move must be worth the round trip.
+        if config.cost_gate_multiple > 0:
+            last_row = df.iloc[-1]
+            gate = regime.cost_gate(
+                _finite(last_row.get("atr_14")),
+                _finite(last_row.get("close")),
+                settings.commission_rate,
+                settings.slippage_rate,
+                config.cost_gate_multiple,
+            )
+            if not gate.get("passes"):
+                counters["skipped"] += 1
+                expected = _json_num(gate.get("expected_move_pct"))
+                needed = _json_num(gate.get("needed_pct")) or 0.0
+                move_txt = (
+                    f"the typical {config.timeframe} move is "
+                    f"{expected * 100:.2f}% of price"
+                    if expected is not None
+                    else f"the typical {config.timeframe} move is unknown"
+                )
+                self._log(
+                    "skip",
+                    symbol=symbol,
+                    detail={
+                        "reason": "cost_gate",
+                        "expected_move_pct": expected,
+                        "needed_pct": needed,
+                        "explanation": (
+                            f"Skipped {symbol}: {move_txt}, but fees + slippage "
+                            f"need at least {needed * 100:.2f}% of expected "
+                            "movement to be worth trading."
+                        ),
+                    },
+                )
+                return False
+
+        # 3) News-sentiment gate: strongly negative fresh news blocks longs,
         # strongly positive blocks shorts. Stale (>3h) or absent sentiment
         # applies no gate at all.
         sentiment = self._fresh_sentiment(symbol)
@@ -1224,7 +1530,11 @@ class AutoTrader:
         if config.use_ai:
             try:
                 analysis = analyze_market(
-                    symbol, config.timeframe, df, news_context=candidate["news_context"]
+                    symbol,
+                    config.timeframe,
+                    df,
+                    news_context=candidate["news_context"],
+                    htf_context=str(candidate.get("htf_context") or ""),
                 )
             except OllamaError as exc:
                 counters["errors"] += 1
@@ -1251,6 +1561,7 @@ class AutoTrader:
                 "confidence": int(analysis.confidence),
                 "reasoning": analysis.reasoning,
                 "risk_commentary": analysis.risk_commentary,
+                "opposing_case": str(getattr(analysis, "opposing_case", "") or ""),
             }
             candidate["ai"] = ai_detail
             wanted = "bullish" if direction == "long" else "bearish"
@@ -1352,7 +1663,8 @@ class AutoTrader:
         """Entry pass 2 (contract step 6): the Fin-R1 second-judge gate.
 
         Re-runs ``analyze_market`` with ``model=config.second_judge_model``
-        on the SAME frame and news context the primary gate saw — in STRICT
+        on the SAME frame, news context and higher-timeframe context the
+        primary gate saw — in STRICT
         no-fallback mode (``allow_fallback=False``): a second opinion from
         the generic fallback model would be worthless (it may even be the
         same model the primary gate fell back to, confirming itself), so a
@@ -1385,6 +1697,7 @@ class AutoTrader:
                 model=model,
                 news_context=candidate.get("news_context"),
                 allow_fallback=False,
+                htf_context=str(candidate.get("htf_context") or ""),
             )
         except OllamaError as exc:
             counters["errors"] += 1
@@ -1448,13 +1761,17 @@ class AutoTrader:
     ) -> None:
         """Contract step 6 (final): size and submit one confirmed entry order.
 
-        Runs AFTER :meth:`_confirm_candidate` (sentiment veto + primary AI
-        gate) and, when active, :meth:`_confirm_judge` — the candidate dict
-        carries their ``ai``/``ai_second`` transparency payloads. The coach
-        playbook's ``size_multiplier`` scales the quantity AFTER the existing
-        caps, with the ``max_position_fraction``, cash and dust guards
-        re-applied (a multiplier above 1.0 can never breach the per-coin
-        fraction cap).
+        Runs AFTER :meth:`_confirm_candidate` (hard gates + sentiment veto +
+        primary AI gate) and, when active, :meth:`_confirm_judge` — the
+        candidate dict carries their ``ai``/``ai_second`` transparency
+        payloads. The coach playbook's ``size_multiplier`` scales the
+        quantity AFTER the existing caps, with the ``max_position_fraction``,
+        cash and dust guards re-applied (a multiplier above 1.0 can never
+        breach the per-coin fraction cap). Contract v3 additions:
+        ``RiskManager.derisk_multiplier`` shrinks the final quantity while
+        the account is in drawdown or near its soft daily stop, and a full-
+        context ``check_order`` (price + stop distance → portfolio heat cap,
+        direction cap) runs immediately before ``submit_order``.
         """
         playbook = playbook or {}
         symbol: str = candidate["symbol"]
@@ -1523,6 +1840,17 @@ class AutoTrader:
                 (config.max_position_fraction * equity) / price,
                 (0.95 * cash) / price,
             )
+        # De-risk multiplier (contract v3) — the FINAL sizing step: shrink new
+        # entries by 0.8 per 10% of drawdown from peak equity, halved again
+        # while the soft daily stop is active. The bot still enters during a
+        # soft daily stop — just at the reduced size.
+        derisk_multiplier = RiskManager.derisk_multiplier(
+            equity,
+            portfolio["peak_equity"],
+            portfolio["realized_pnl_today"],
+            settings.daily_loss_limit,
+        )
+        qty *= derisk_multiplier
         notional = qty * price
         if qty <= 0 or notional < _MIN_NOTIONAL_USD:
             counters["skipped"] += 1
@@ -1583,6 +1911,36 @@ class AutoTrader:
             )
             return
 
+        # Pre-submit risk check with FULL order context (contract v3): the
+        # engine's own check_order call has no price/stop, so the portfolio
+        # heat cap and the direction cap are enforced here, where the stop
+        # distance is known.
+        check = self.risk.check_order(
+            portfolio,
+            self.engine.get_positions("open"),
+            side=side,
+            qty=qty,
+            symbol=symbol,
+            source=config.source,
+            timeframe=config.timeframe,
+            price=price,
+            stop_loss=stop_loss,
+        )
+        if not check.allowed:
+            counters["rejected"] += 1
+            self._log(
+                "reject",
+                symbol=symbol,
+                detail={
+                    "reason": check.reason,
+                    "explanation": (
+                        f"Entry order for {symbol} was blocked by the risk "
+                        f"manager before submission: {check.reason}"
+                    ),
+                },
+            )
+            return
+
         try:
             order = self.engine.submit_order(
                 symbol,
@@ -1638,6 +1996,10 @@ class AutoTrader:
                 "votes": votes,
                 "rank_score": _json_num(candidate.get("rank_score", abs(vote_sum))),
                 "sentiment_bonus": _json_num(candidate.get("sentiment_bonus", 0.0)),
+                "shadow_flags": regime.shadow_flags(
+                    df, datetime.now(timezone.utc).hour
+                ),
+                "derisk_multiplier": _json_num(derisk_multiplier),
                 "indicators": indicators,
                 "ai": ai_detail,
                 "ai_second": candidate.get("ai_second"),
@@ -1750,7 +2112,13 @@ class AutoTrader:
         )
 
     def _log_exit(self, position: dict[str, Any], reason: str) -> None:
-        """Write an ``exit`` activity row for a closed position."""
+        """Write an ``exit`` activity row for a closed position.
+
+        Contract v3: every exit row carries the R-multiple diagnostics
+        ``designed_r`` (reward:risk the entry was placed with) and
+        ``realized_r`` (actual PnL in units of the risked stop distance) —
+        both ``None`` when the position had no valid stop geometry.
+        """
         symbol = str(position.get("symbol") or "")
         side = str(position.get("side") or "long")
         qty = float(position.get("qty") or 0.0)
@@ -1760,6 +2128,7 @@ class AutoTrader:
         pnl = float(position.get("pnl") or 0.0)
         entry_notional = qty * entry_price
         pnl_pct = pnl / entry_notional if entry_notional > 0 else 0.0
+        designed_r, realized_r = _r_multiples(position)
 
         if reason == "ensemble_flip":
             why = f"the strategy ensemble flipped against the {side} stance"
@@ -1780,6 +2149,8 @@ class AutoTrader:
                 "reason": reason,
                 "pnl": _json_num(pnl),
                 "pnl_pct": _json_num(pnl_pct),
+                "designed_r": _json_num(designed_r),
+                "realized_r": _json_num(realized_r),
                 "explanation": explanation,
             },
         )

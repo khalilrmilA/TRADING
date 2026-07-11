@@ -15,6 +15,7 @@ from backend.indicators.features import add_features
 from backend.indicators.technical import atr, bollinger, ema, macd, rsi, sma
 
 FEATURE_COLUMNS = [
+    # Original 17 (unchanged and first — Indicator Pack v4 contract).
     "sma_20",
     "sma_50",
     "ema_12",
@@ -32,6 +33,38 @@ FEATURE_COLUMNS = [
     "ret_5",
     "volatility_20",
     "momentum_10",
+    # Indicator Pack v4 — canonical 48-name list per CONTRACTS.md.
+    "adx_14",
+    "di_plus_14",
+    "di_minus_14",
+    "stoch_k",
+    "stoch_d",
+    "stoch_rsi_k",
+    "williams_r_14",
+    "cci_20",
+    "roc_10",
+    "mfi_14",
+    "obv",
+    "cmf_20",
+    "vwma_20",
+    "rel_volume_20",
+    "supertrend_10_3",
+    "supertrend_dir",
+    "psar",
+    "aroon_up_25",
+    "aroon_down_25",
+    "donchian_upper_20",
+    "donchian_lower_20",
+    "keltner_upper_20",
+    "keltner_lower_20",
+    "bb_pct_b",
+    "bb_bandwidth",
+    "hull_20",
+    "trix_15",
+    "ichimoku_tenkan",
+    "ichimoku_kijun",
+    "ichimoku_senkou_a",
+    "ichimoku_senkou_b",
 ]
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 

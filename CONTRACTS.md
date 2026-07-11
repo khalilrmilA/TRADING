@@ -1233,3 +1233,271 @@ traders' regime/cost gates, ATR geometry, shrink-only tuner + martingale ban, R 
 `test_watchdog.py` = watchdog transitions, restart cooldown + missing-file guard (mocked
 `Popen`/`is_available`), `ai_offline` cycle/tune skips, `/health` fields. All offline — no
 network, no Ollama, tmp DB via the existing conftest patterns.
+
+## Indicator Pack v4
+
+Binding contracts for the v4 indicator expansion: ~20 new pure indicator functions in
+`backend/indicators/technical.py`, the canonical `FEATURE_COLUMNS` list grows from 17 to **48**
+(original 17 unchanged and FIRST), and `feature_summary` gains new qualitative flags plus a
+compact nested `groups` dict for the analyst prompt. **PAPER ONLY — unchanged.** Pure
+pandas/numpy only (no TA-Lib). The no-lookahead invariant is absolute: every new column at row
+`t` uses data at rows `<= t` only, and the existing prefix-stability test semantics
+(`add_features(df[:100]) == add_features(df)[:100]`) MUST hold over the FULL 48-column set.
+
+Conventions for this section (all binding):
+- **"Wilder smoothing"** always means `ewm(alpha=1/window, adjust=False).mean()` — identical to
+  the existing `rsi`/`atr` implementations. **"SMA"/"rolling"** always means
+  `rolling(window, min_periods=window)` — identical to the existing `sma`. **"EMA"** always
+  means `ewm(span=window, adjust=False).mean()` — identical to the existing `ema`.
+- All outputs are float64 Series (or tuples of Series) aligned to the input index, NaN during
+  warm-up. No artificial NaN masking beyond what the formulas produce (consistent with
+  `rsi`/`atr`: early ewm values exist but are unsettled — tests must not pin exact values in
+  the first `window` bars of any Wilder-smoothed output).
+- New functions reuse `_validate_window` / `_require_columns`, get Google-style docstrings and
+  are appended to `__all__`. The existing 11 functions are byte-identical after this pack.
+- `df` parameters are canonical OHLCV frames; `s` parameters are price Series (typically close).
+
+### 1. backend/indicators/technical.py — NEW FUNCTIONS — owner: builder-technical
+
+```
+adx(df, window=14) -> tuple[pd.Series, pd.Series, pd.Series]        # (adx, di_plus, di_minus)
+stochastic(df, k_window=14, d_window=3, smooth_k=3) -> tuple[pd.Series, pd.Series]   # (k, d)
+stoch_rsi(s, rsi_window=14, stoch_window=14, k=3, d=3) -> tuple[pd.Series, pd.Series] # (k, d)
+williams_r(df, window=14) -> pd.Series
+cci(df, window=20) -> pd.Series
+roc(s, window=10) -> pd.Series                                      # PERCENT
+mfi(df, window=14) -> pd.Series
+obv(df) -> pd.Series
+cmf(df, window=20) -> pd.Series
+adl(df) -> pd.Series
+vwma(df, window=20) -> pd.Series
+supertrend(df, window=10, multiplier=3.0) -> tuple[pd.Series, pd.Series]  # (line, direction)
+psar(df, af_start=0.02, af_step=0.02, af_max=0.2) -> pd.Series
+aroon(df, window=25) -> tuple[pd.Series, pd.Series]                 # (aroon_up, aroon_down)
+donchian(df, window=20) -> tuple[pd.Series, pd.Series, pd.Series]   # (upper, mid, lower)
+keltner(df, window=20, atr_window=10, multiplier=2.0) -> tuple[pd.Series, pd.Series, pd.Series]
+hull_ma(s, window=20) -> pd.Series
+trix(s, window=15) -> pd.Series                                     # PERCENT
+ichimoku(df) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]   # (tenkan, kijun, senkou_a, senkou_b)
+bollinger_pct_b(close, upper, lower) -> pd.Series                   # lives HERE (pinned below)
+bollinger_bandwidth(upper, mid, lower) -> pd.Series                 # lives HERE (pinned below)
+```
+
+Canonical formulas (binding — variant named in each case):
+
+- **adx** — Wilder throughout, consistent with existing `rsi`/`atr`.
+  `up = high.diff()`, `down = -low.diff()`;
+  `+DM = up where (up > down) & (up > 0) else 0`; `-DM = down where (down > up) & (down > 0) else 0`.
+  `di_plus = 100 * wilder(+DM) / atr(df, window)`, `di_minus = 100 * wilder(-DM) / atr(df, window)`
+  (reuse the existing `atr` — Wilder-smoothed TR; mask division by 0 → NaN).
+  `dx = 100 * |di_plus - di_minus| / (di_plus + di_minus)` (denominator 0 → NaN);
+  `adx = wilder(dx)`. All three in `[0, 100]`.
+- **stochastic** — classic slow stochastic, SMA smoothing:
+  `raw_k = 100 * (close - LL) / (HH - LL)` with `HH = high.rolling(k_window).max()`,
+  `LL = low.rolling(k_window).min()` (min_periods=k_window; `HH == LL` → NaN);
+  `k = sma(raw_k, smooth_k)`; `d = sma(k, d_window)`. Range `[0, 100]`.
+- **stoch_rsi** — stochastic OF the existing Wilder `rsi`, pinned to the **0–100 scale**
+  (TradingView plot scale, consistent with `stochastic` and the 20/80 zone flags):
+  `r = rsi(s, rsi_window)`; `raw = 100 * (r - r.rolling(stoch_window).min()) /
+  (r.rolling(stoch_window).max() - r.rolling(stoch_window).min())` (flat window → NaN);
+  `k_line = sma(raw, k)`; `d_line = sma(k_line, d)`.
+- **williams_r** — `-100 * (HH - close) / (HH - LL)` with HH/LL over `window` bars including
+  the current bar (`HH == LL` → NaN). Range `[-100, 0]`.
+- **cci** — `tp = (high + low + close) / 3`;
+  `cci = (tp - sma(tp, window)) / (0.015 * MAD)` where `MAD` = rolling mean absolute deviation
+  of `tp` about the rolling mean over `window` bars (`MAD == 0` → NaN). Implementation free
+  (e.g. `rolling(window).apply(..., raw=True)`); formula binding.
+- **roc** — `100 * (s / s.shift(window) - 1)` — human-scale **percent** (= `momentum * 100`).
+- **mfi** — rolling-SUM variant (classic, NOT Wilder): `tp = (high+low+close)/3`;
+  `rmf = tp * volume`; positive flow where `tp > tp.shift(1)`, negative where `tp < tp.shift(1)`,
+  ties contribute to neither; `pos/neg = rolling(window, min_periods=window).sum()` of each;
+  `mfi = 100 * pos / (pos + neg)`; pinned edge cases mirroring `rsi`: `neg == 0 & pos > 0` → 100,
+  `pos == 0 & neg > 0` → 0, both 0 → 50. Range `[0, 100]`.
+- **obv** — `(sign(close.diff()) * volume).fillna(0).cumsum()`; first bar contributes 0;
+  unbounded, in volume units.
+- **cmf** — Money Flow Multiplier `mfm = ((close - low) - (high - close)) / (high - low)`,
+  pinned `mfm = 0.0` where `high == low`; `mfv = mfm * volume`;
+  `cmf = rolling(window).sum()(mfv) / rolling(window).sum()(volume)` (volume sum 0 → NaN).
+  Range `[-1, 1]`.
+- **adl** — Accumulation/Distribution Line: `mfv.cumsum()` (same `mfm`, same `high == low` → 0
+  rule). Unbounded.
+- **vwma** — `rolling(window).sum()(close * volume) / rolling(window).sum()(volume)`
+  (volume sum 0 → NaN).
+- **supertrend** — Wilder ATR (reuse `atr(df, window)`), `hl2 = (high + low) / 2`;
+  `upper_basic = hl2 + multiplier * atr`; `lower_basic = hl2 - multiplier * atr`.
+  Rows `0 .. window-1` are NaN (line AND direction — pinned warm-up). Recursion starts at
+  `t0 = window` (0-indexed) with `final_upper = upper_basic[t0]`, `final_lower =
+  lower_basic[t0]`, `direction[t0] = +1.0 if close[t0] >= hl2[t0] else -1.0` (pinned seed;
+  self-corrects within a few bars). For `t > t0`:
+  `final_upper[t] = upper_basic[t] if (upper_basic[t] < final_upper[t-1] or close[t-1] >
+  final_upper[t-1]) else final_upper[t-1]`; `final_lower[t]` mirrored;
+  `direction[t] = +1 if close[t] > final_upper[t-1]; -1 if close[t] < final_lower[t-1];
+  else direction[t-1]`. `line = final_lower where direction == +1 else final_upper`.
+  `direction` is float `+1.0 / -1.0` (NaN in warm-up). O(n) Python loop acceptable.
+- **psar** — classic Wilder parabolic SAR, iterative O(n) loop (explicitly acceptable).
+  `psar[0] = NaN`; needs ≥ 2 bars (1-row frame → all-NaN). Initial trend at bar 1: up if
+  `close[1] >= close[0]` else down; initial `sar = low[0]` (up) / `high[0]` (down); initial
+  `ep = max(high[0], high[1])` (up) / `min(low[0], low[1])` (down); `af = af_start`.
+  Per bar `t >= 2`: `sar[t] = sar[t-1] + af * (ep - sar[t-1])`; clamp — uptrend
+  `sar[t] = min(sar[t], low[t-1], low[t-2])`, downtrend `sar[t] = max(sar[t], high[t-1],
+  high[t-2])`. Reversal when the bar pierces the SAR (uptrend: `low[t] < sar[t]`; downtrend:
+  `high[t] > sar[t]`): flip trend, `sar[t] = prior ep`, `ep = low[t]` / `high[t]`, `af =
+  af_start`. Otherwise on a new extreme (`high[t] > ep` up / `low[t] < ep` down): `ep =
+  extreme`, `af = min(af + af_step, af_max)`. Returns the SAR level in effect at each bar.
+- **aroon** — over the last `window + 1` bars INCLUDING the current bar (needs `window + 1`
+  rows; first `window` rows NaN):
+  `aroon_up = 100 * (window - bars_since_highest_high) / window`; `aroon_down` mirrored with
+  the lowest low. Tie rule (pinned): the MOST RECENT occurrence of the extreme wins (a flat
+  window yields 100/100). Range `[0, 100]`.
+- **donchian** — `upper = high.rolling(window).max()`, `lower = low.rolling(window).min()`,
+  `mid = (upper + lower) / 2` — INCLUDES the current bar, no shift (consumers wanting prior-bar
+  channels shift themselves, as the breakout strategy already does).
+- **keltner** — `mid = ema(close, window)` (**EMA mid — pinned**); `upper/lower = mid ±
+  multiplier * atr(df, atr_window)` (Wilder ATR).
+- **hull_ma** — `HMA = wma(2 * wma(s, half) - wma(s, window), sqrt_w)` where `wma` is the
+  linearly-weighted MA (weights `1..k`, most recent heaviest, `rolling(k, min_periods=k)`),
+  `half = max(1, window // 2)` (floor), `sqrt_w = max(1, int(round(math.sqrt(window))))`
+  (round — TradingView convention; for window=20 → half=10, sqrt_w=4).
+- **trix** — triple EMA: `t3 = ema(ema(ema(s, window), window), window)`;
+  `trix = 100 * (t3 / t3.shift(1) - 1)` — 1-bar **percent** rate of change.
+- **ichimoku** — fixed classic constants, no parameters: `tenkan = (high.rolling(9).max() +
+  low.rolling(9).min()) / 2`; `kijun = same with 26`; `senkou_a_raw = (tenkan + kijun) / 2`;
+  `senkou_b_raw = (high.rolling(52).max() + low.rolling(52).min()) / 2`; displacement = 26.
+  **PINNED LOOKAHEAD CONVENTION — "cloud in effect at t":** the returned spans are the raw
+  spans shifted FORWARD by the displacement — `senkou_a = senkou_a_raw.shift(26)`,
+  `senkou_b = senkou_b_raw.shift(26)` — i.e. row `t` holds the cloud a chartist actually sees
+  above/below price at time `t`, computed exclusively from data `<= t-26`. Justification:
+  (a) it is the only convention in which the canonical price-vs-cloud signal
+  (`ichimoku_state`) means what every chart and textbook means by it; (b) the unshifted
+  as-computed values at `t` are just an average of tenkan/kijun-family windows ending at `t` —
+  redundant with columns we already store and NOT a "cloud" relative to current price;
+  (c) `shift(+26)` is strictly backward-looking, so prefix-stability holds unchanged.
+  Warm-up: tenkan NaN first 8 rows, kijun first 25, senkou_a first 51 (25+26), senkou_b first
+  77 (51+26) — callers need ~80+ rows for a full set (bot uses limit=500: fine).
+  **chikou is EXCLUDED** from this platform entirely — it is `close.shift(-26)` (the future by
+  construction) and must never appear in any function, column or prompt.
+- **bollinger_pct_b / bollinger_bandwidth** — PINNED DECISION: these live in `technical.py`
+  (not features.py) because they are pure indicator math reusable by strategies; features.py
+  stays a thin wiring layer. `bollinger_pct_b = (close - lower) / (upper - lower)` (band width
+  0 → NaN; NOT clipped — values outside `[0, 1]` are meaningful band breaks).
+  `bollinger_bandwidth = (upper - lower) / mid` (`mid == 0` → NaN).
+
+### 2. backend/indicators/features.py — FEATURE_COLUMNS v4 — owner: builder-features
+
+`FEATURE_COLUMNS` becomes EXACTLY this 48-name tuple, in EXACTLY this order — the original 17
+unchanged and FIRST (backward compatibility: every existing consumer indexes by name and is
+unaffected; anything indexing by position past the OHLCV+17 boundary was never contractual):
+
+```
+sma_20, sma_50, ema_12, ema_26, rsi_14, macd, macd_signal, macd_hist,
+bb_upper, bb_mid, bb_lower, atr_14, vwap, ret_1, ret_5, volatility_20, momentum_10,
+adx_14, di_plus_14, di_minus_14, stoch_k, stoch_d, stoch_rsi_k, williams_r_14,
+cci_20, roc_10, mfi_14, obv, cmf_20, vwma_20, rel_volume_20,
+supertrend_10_3, supertrend_dir, psar, aroon_up_25, aroon_down_25,
+donchian_upper_20, donchian_lower_20, keltner_upper_20, keltner_lower_20,
+bb_pct_b, bb_bandwidth, hull_20, trix_15,
+ichimoku_tenkan, ichimoku_kijun, ichimoku_senkou_a, ichimoku_senkou_b
+```
+
+Wiring (all defaults; binding):
+- `adx_14, di_plus_14, di_minus_14 = adx(df)`; `stoch_k, stoch_d = stochastic(df)`;
+  `stoch_rsi_k = stoch_rsi(close)[0]`; `williams_r_14 = williams_r(df)`; `cci_20 = cci(df)`;
+  `roc_10 = roc(close)`; `mfi_14 = mfi(df)`; `obv = obv(df)`; `cmf_20 = cmf(df)`;
+  `vwma_20 = vwma(df)`; `supertrend_10_3, supertrend_dir = supertrend(df)`;
+  `psar = psar(df)`; `aroon_up_25, aroon_down_25 = aroon(df)`;
+  `donchian_upper_20, _, donchian_lower_20 = donchian(df)`;
+  `keltner_upper_20, _, keltner_lower_20 = keltner(df)`; `hull_20 = hull_ma(close)`;
+  `trix_15 = trix(close)`; `ichimoku_tenkan, ichimoku_kijun, ichimoku_senkou_a,
+  ichimoku_senkou_b = ichimoku(df)` (the pinned shifted/cloud-in-effect spans).
+- `rel_volume_20 = volume / sma(volume, 20)` (computed in features.py — a derivation, not a
+  new technical function; SMA 0 or NaN → NaN).
+- `bb_pct_b = bollinger_pct_b(close, bb_upper, bb_lower)` and `bb_bandwidth =
+  bollinger_bandwidth(bb_upper, bb_mid, bb_lower)` — reuse the band columns already computed
+  in `add_features` (do NOT recompute bollinger).
+- Deliberately NOT feature columns (functions exist for strategies/ad-hoc analysis only, kept
+  out of the frame to bound prompt/DB size): `stoch_rsi` d-line, `adl`, donchian `mid`,
+  keltner `mid`.
+- The empty-frame path extends unchanged: all 48 columns as empty float64 Series.
+
+Test impact (binding): `tests/test_indicators.py` pins "exactly 17" in two places — its local
+`FEATURE_COLUMNS` list and `test_add_features_exact_columns` — this contract SUPERSEDES those
+pins; the Green-phase integrator updates them to the canonical 48-name list above (§5). The
+`test_no_lookahead` prefix test MUST keep passing over all 48 columns as-is — psar/supertrend
+recursions always start from bar 0, hence prefix-stable; ichimoku's forward shift is causal.
+
+### 3. feature_summary v4 — owner: builder-features
+
+- ALL 48 columns included as numbers via the existing `_json_safe_number` (round 6, NaN →
+  None), plus `price`, exactly as today. The existing 4 flags (`price_vs_sma20`, `macd_state`,
+  `rsi_zone`, `bb_position`) are unchanged.
+- NEW derived qualitative flags (top-level flat keys; every flag is `None` when any required
+  input is None/warm-up, matching the existing flags). Pinned thresholds:
+  - `adx_trend`: `"strong"` when `adx_14 >= 25`; `"weak"` when `adx_14 < 20`; else `"moderate"`.
+  - `di_state`: `"bullish"` when `di_plus_14 > di_minus_14` else `"bearish"` (strict `>`,
+    matching `macd_state`).
+  - `stoch_zone`: `"oversold"` when `stoch_k < 20`; `"overbought"` when `stoch_k > 80`;
+    else `"neutral"`.
+  - `williams_zone`: `"oversold"` when `williams_r_14 < -80`; `"overbought"` when
+    `williams_r_14 > -20`; else `"neutral"`.
+  - `cci_zone`: `"overbought"` when `cci_20 > 100`; `"oversold"` when `cci_20 < -100`;
+    else `"neutral"`.
+  - `mfi_zone`: `"oversold"` when `mfi_14 < 20`; `"overbought"` when `mfi_14 > 80`;
+    else `"neutral"`.
+  - `obv_trend`: `"rising"` when the last `obv` value > SMA20 of the `obv` column
+    (`obv.rolling(20, min_periods=20).mean()` at the last row — computed on the fly in
+    feature_summary, NOT a stored column) else `"falling"`; `None` when < 20 rows.
+  - `supertrend_side`: `"bullish"` when `supertrend_dir > 0` else `"bearish"`.
+  - `psar_side`: `"bullish"` when `price > psar` else `"bearish"`.
+  - `aroon_state`: `"bullish"` when `aroon_up_25 > 70 and aroon_down_25 < 30`; `"bearish"`
+    when `aroon_down_25 > 70 and aroon_up_25 < 30`; else `"neutral"`.
+  - `ichimoku_state`: with `cloud_top = max(ichimoku_senkou_a, ichimoku_senkou_b)` and
+    `cloud_bot = min(...)` (the pinned in-effect spans): `"above_cloud"` when
+    `price > cloud_top`; `"below_cloud"` when `price < cloud_bot`; else `"in_cloud"`.
+  - `squeeze_on`: boolean — `True` when `bb_upper < keltner_upper_20 AND bb_lower >
+    keltner_lower_20` (Bollinger fully inside Keltner), else `False`; `None` on NaN inputs.
+  - `donchian_position`: `"at_upper"` when `price >= donchian_upper_20`; `"at_lower"` when
+    `price <= donchian_lower_20`; else `"upper_half"` when `price >= (donchian_upper_20 +
+    donchian_lower_20) / 2` else `"lower_half"`.
+- PROMPT-SIZE RULE (binding): `summary["groups"]` is a nested dict containing ONLY the
+  qualitative flags (same values as the flat keys — a compact, family-grouped view the LLM can
+  scan; the small duplication is accepted), with EXACTLY this membership:
+  ```
+  summary["groups"] = {
+    "trend":      {"price_vs_sma20", "adx_trend", "di_state", "supertrend_side",
+                   "psar_side", "aroon_state", "ichimoku_state"},
+    "momentum":   {"macd_state", "rsi_zone", "stoch_zone", "williams_zone", "cci_zone"},
+    "volume":     {"mfi_zone", "obv_trend"},
+    "volatility": {"bb_position", "squeeze_on", "donchian_position"},
+  }              # each set shown = the flat keys copied under that group, key: value
+  ```
+- `backend/ai/analyst.py` is NOT touched in this pack: `_build_prompt` keeps serializing the
+  flat `feature_summary` dict as before and the new keys (≈31 numbers + 13 flags + `groups`)
+  flow into the prompt automatically. The prompt grows by roughly 30 numeric keys — accepted.
+
+### 4. Performance budget (binding)
+
+`add_features` on a 2,000-row canonical frame must complete in under **~150 ms** (median of 5
+runs, `time.perf_counter`, dev box). The O(n) Python loops in `psar` and `supertrend` are
+explicitly acceptable within that budget; `cci`'s MAD and `hull_ma`'s WMA may use
+`rolling(...).apply(..., raw=True)` (raw=True REQUIRED — no per-row pandas objects). No other
+Python-level per-row iteration in `add_features`.
+
+### 5. File ownership (binding — edit ONLY your files)
+
+| file | owner |
+|---|---|
+| `backend/indicators/technical.py` | builder-technical |
+| `backend/indicators/features.py` | builder-features |
+| `tests/test_indicators_v4.py` (new) | test-agent |
+| `tests/test_indicators.py` — ONLY the two exactly-17 pins (local `FEATURE_COLUMNS` list + `test_add_features_exact_columns`), updated to the 48-name canonical list | Green-phase integrator |
+| `CONTRACTS.md` | spec agent ONLY |
+
+No one touches `analyst.py`, any strategy file, `engine.py` or `schema.sql` in this pack.
+`tests/test_indicators_v4.py` scope: range bounds (adx/di/stoch/stoch_rsi/mfi/aroon in
+`[0, 100]`, williams in `[-100, 0]`, cmf in `[-1, 1]`), band ordering (donchian and keltner
+upper ≥ mid ≥ lower), `supertrend_dir ∈ {+1.0, -1.0}` after warm-up, psar flips to the
+opposite side of price after a reversal, `ichimoku` shift identity
+(`senkou_a[t] == senkou_a_raw[t-26]`), the pinned edge cases (mfi 100/0/50, cmf `high==low`,
+stochastic flat window → NaN), no-lookahead prefix stability over the full 48 columns, and a
+performance smoke test asserting the §4 budget (generous CI margin: assert < 500 ms, log the
+measured time). Offline, seeded synthetic frames via the existing conftest patterns.

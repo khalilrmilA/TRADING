@@ -904,6 +904,89 @@ class PaperTradingEngine:
             )
             return out
 
+    def update_protective_levels(
+        self,
+        position_id: int,
+        stop_loss: float | None = None,
+        clear_take_profit: bool = False,
+    ) -> dict[str, Any]:
+        """Tighten an open position's protective levels (trailing-stop support).
+
+        TIGHTEN-ONLY by construction — this method can never widen risk:
+        a long's stop may only move UP, a short's stop only DOWN; a proposed
+        stop that loosens (or merely equals) the current one is silently
+        ignored. ``clear_take_profit`` removes the take-profit so a winner
+        can keep running while the (tightened) trailing stop protects the
+        gain. Used by the auto-trader's "let winners run" trailing logic.
+
+        Args:
+            position_id: Id of an OPEN row in ``paper_positions``.
+            stop_loss: Proposed new stop price (None → leave the stop alone).
+                Must be a positive finite number to be considered.
+            clear_take_profit: True → set ``take_profit`` to NULL.
+
+        Returns:
+            dict: The (possibly updated) open position record, with an extra
+            ``"stop_moved": bool`` key telling whether the stop changed.
+
+        Raises:
+            ValueError: Unknown or already-closed position.
+        """
+        with self._lock, self._connect() as conn:
+            pos = conn.execute(
+                "SELECT * FROM paper_positions WHERE id=?", (int(position_id),)
+            ).fetchone()
+            if pos is None:
+                raise ValueError(f"position {position_id} not found")
+            if pos["status"] != "open":
+                raise ValueError(f"position {position_id} is already closed")
+
+            side = str(pos["side"])
+            current_stop = pos["stop_loss"]
+            new_stop: float | None = None
+            if stop_loss is not None:
+                try:
+                    candidate = float(stop_loss)
+                except (TypeError, ValueError):
+                    candidate = math.nan
+                if math.isfinite(candidate) and candidate > 0.0:
+                    if current_stop is None:
+                        new_stop = candidate
+                    elif side == "long" and candidate > float(current_stop):
+                        new_stop = candidate
+                    elif side == "short" and candidate < float(current_stop):
+                        new_stop = candidate
+
+            if new_stop is None and not clear_take_profit:
+                out = self._position_dict(pos)
+                out["stop_moved"] = False
+                return out
+
+            sets: list[str] = []
+            params: list[Any] = []
+            if new_stop is not None:
+                sets.append("stop_loss=?")
+                params.append(new_stop)
+            if clear_take_profit:
+                sets.append("take_profit=NULL")
+            params.append(int(position_id))
+            conn.execute(
+                f"UPDATE paper_positions SET {', '.join(sets)} WHERE id=?", params
+            )
+
+            row = conn.execute(
+                "SELECT * FROM paper_positions WHERE id=?", (int(position_id),)
+            ).fetchone()
+            out = self._position_dict(row)
+            out["stop_moved"] = new_stop is not None
+            if new_stop is not None:
+                logger.info(
+                    "Position #%s trailing stop tightened to %.8g (paper)",
+                    position_id,
+                    new_stop,
+                )
+            return out
+
     def get_portfolio(self) -> dict[str, Any]:
         """Return the current account snapshot.
 

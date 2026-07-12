@@ -139,6 +139,22 @@ class BotConfigUpdate(BaseModel):
             "here — BotConfig clamps it to [0, 10] instead of rejecting."
         ),
     )
+    trailing_enabled: bool | None = Field(
+        None,
+        description=(
+            "'Let winners run' trailing stops: once a bot position gains "
+            "trail_activate_pct, its stop follows the best close at "
+            "trail_distance_pct behind and the take-profit is removed."
+        ),
+    )
+    trail_activate_pct: float | None = Field(
+        None,
+        description="Gain that activates trailing. Not range-checked here — BotConfig clamps to [0.005, 0.2].",
+    )
+    trail_distance_pct: float | None = Field(
+        None,
+        description="Trail distance behind the best close. Not range-checked here — BotConfig clamps to [0.005, 0.1].",
+    )
     use_second_judge: bool | None = Field(
         None, description="Require the finance-specialist second judge to agree before entering."
     )

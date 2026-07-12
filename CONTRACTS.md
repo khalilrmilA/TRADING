@@ -1501,3 +1501,11 @@ opposite side of price after a reversal, `ichimoku` shift identity
 stochastic flat window → NaN), no-lookahead prefix stability over the full 48 columns, and a
 performance smoke test asserting the §4 budget (generous CI margin: assert < 500 ms, log the
 measured time). Offline, seeded synthetic frames via the existing conftest patterns.
+
+## Trailing Stops ("let winners run", 2026-07-12)
+
+Bot-only (scalper untouched — its fixed TP/SL + time-stop remain tuner territory).
+
+- `BotConfig` gains `trailing_enabled: bool = True`, `trail_activate_pct: float = 0.02` (clamp [0.005, 0.2]), `trail_distance_pct: float = 0.015` (clamp [0.005, 0.1]); exposed via `BotConfigUpdate`.
+- `PaperTradingEngine.update_protective_levels(position_id, stop_loss=None, clear_take_profit=False)` — TIGHTEN-ONLY: a long's stop may only move up, a short's only down; loosening proposals are silently ignored (`stop_moved` reports the outcome). `clear_take_profit=True` sets `take_profit` NULL. Raises ValueError on unknown/closed positions.
+- `AutoTrader._update_trailing(config, position, df)` runs from `_manage_positions` for every surviving (non-flipped) bot position: activation at `gain >= trail_activate_pct` (close-based), stop = best CLOSE since entry ± `trail_distance_pct` (closes, not wicks), take-profit cleared on activation, `trail` activity row (reason `trailing_stop`, plain-English explanation with locked-in %) logged only when the stop actually moves. Never raises; scalper-owned ids never reach it.

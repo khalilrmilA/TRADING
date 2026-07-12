@@ -421,6 +421,21 @@ class BotConfig(BaseModel):
     sentiment_rank_weight: float = 0.5
     regime_gate_enabled: bool = True
     cost_gate_multiple: float = 3.0
+    trailing_enabled: bool = True
+    trail_activate_pct: float = 0.02
+    trail_distance_pct: float = 0.015
+
+    @field_validator("trail_activate_pct")
+    @classmethod
+    def _clamp_trail_activate(cls, value: float) -> float:
+        """Clamp the trailing activation gain to [0.005, 0.2] (0.5%–20%)."""
+        return min(0.2, max(0.005, float(value)))
+
+    @field_validator("trail_distance_pct")
+    @classmethod
+    def _clamp_trail_distance(cls, value: float) -> float:
+        """Clamp the trailing distance to [0.005, 0.1] (0.5%–10%)."""
+        return min(0.1, max(0.005, float(value)))
 
     @field_validator("sentiment_rank_weight")
     @classmethod
@@ -703,7 +718,7 @@ class AutoTrader:
         # halt (daily loss / circuit breaker) is exactly when those stops
         # must keep working. RiskManager explicitly allows risk-reducing
         # exits during a halt — only NEW entries are gated below.
-        self._manage_positions(voter, counters)
+        self._manage_positions(voter, counters, config=config)
 
         # --- 3) halt gate: a halt skips new entries only ----------------------
         portfolio = self.engine.get_portfolio()
@@ -861,7 +876,10 @@ class AutoTrader:
         return True
 
     def _manage_positions(
-        self, voter: VotingStrategy, counters: dict[str, int]
+        self,
+        voter: VotingStrategy,
+        counters: dict[str, int],
+        config: BotConfig | None = None,
     ) -> None:
         """Contract step 2: tick every open-position symbol, exit on flips.
 
@@ -877,7 +895,26 @@ class AutoTrader:
         ``'scalper_position_ids'``) are SKIPPED entirely: the fast scalper
         script manages its own exits (fixed-percent SL/TP + time-stop), so
         the bot neither ensemble-flip-closes nor double-logs them.
+
+        "Let winners run" (trailing stops): every surviving (non-flipped)
+        bot position also gets a :meth:`_update_trailing` pass — once a
+        winner's gain reaches ``config.trail_activate_pct`` its stop starts
+        following the price at ``config.trail_distance_pct`` behind the best
+        close since entry, and the take-profit is removed so the winner can
+        keep running. The engine enforces tighten-only, so trailing can
+        never widen risk.
+
+        Args:
+            voter: The ensemble voting strategy.
+            counters: Cycle counters, mutated in place.
+            config: Active bot configuration (None → re-read persisted
+                config; kept optional for direct/test callers).
         """
+        if config is None:
+            try:
+                config = self.get_config()
+            except Exception:  # noqa: BLE001 — trailing is best-effort
+                config = BotConfig()
         scalper_ids = self._scalper_owned_ids()
         seen: set[tuple[str, str, str]] = set()
         for pos in self.engine.get_positions("open"):
@@ -932,6 +969,7 @@ class AutoTrader:
                         open_pos["side"] == "short" and stance > 0
                     )
                     if not flipped:
+                        self._update_trailing(config, open_pos, df)
                         continue
                     closed = self.engine.close_position(int(open_pos["id"]))
                     counters["exited"] += 1
@@ -942,6 +980,104 @@ class AutoTrader:
                 self._log(
                     "error", symbol=symbol, detail={"where": "manage", "reason": str(exc)}
                 )
+
+    def _update_trailing(
+        self,
+        config: BotConfig,
+        position: dict[str, Any],
+        df: pd.DataFrame,
+    ) -> None:
+        """Trail a winning position's stop behind its best price ("let winners run").
+
+        Activation: the position's gain (close-based) must reach
+        ``config.trail_activate_pct``. Then the stop is placed
+        ``config.trail_distance_pct`` behind the best CLOSE since entry
+        (closes, not wicks — one spiky wick must not yank the stop) and the
+        take-profit is cleared so the winner keeps running until the trail
+        is hit or the ensemble flips. The engine's
+        ``update_protective_levels`` is tighten-only, so this can only ever
+        lock in MORE profit, never widen risk. Logs a ``trail`` activity row
+        when the stop actually moves. Never raises.
+
+        Args:
+            config: Active bot configuration (trailing knobs).
+            position: Open position dict (engine shape).
+            df: Fresh feature frame for the position's symbol (closed
+                candles only, ascending).
+        """
+        if not config.trailing_enabled:
+            return
+        try:
+            side = str(position.get("side") or "long")
+            entry = _finite(position.get("entry_price"))
+            last_close = _finite(df["close"].iloc[-1]) if len(df) else None
+            if entry is None or entry <= 0 or last_close is None:
+                return
+
+            gain = (
+                (last_close - entry) / entry
+                if side == "long"
+                else (entry - last_close) / entry
+            )
+            if gain < config.trail_activate_pct:
+                return
+
+            # Best close since entry (fallback: the latest close).
+            best = last_close
+            opened_ms = position.get("opened_at")
+            try:
+                opened_ts = pd.Timestamp(int(opened_ms), unit="ms", tz="UTC")
+                window = df.loc[df.index >= opened_ts, "close"]
+                if len(window):
+                    best = (
+                        max(float(window.max()), last_close)
+                        if side == "long"
+                        else min(float(window.min()), last_close)
+                    )
+            except (TypeError, ValueError, KeyError):
+                pass
+
+            new_stop = (
+                best * (1.0 - config.trail_distance_pct)
+                if side == "long"
+                else best * (1.0 + config.trail_distance_pct)
+            )
+            old_stop = _finite(position.get("stop_loss"))
+            result = self.engine.update_protective_levels(
+                int(position["id"]), stop_loss=new_stop, clear_take_profit=True
+            )
+            if not result.get("stop_moved"):
+                return
+
+            symbol = str(position.get("symbol") or "")
+            locked = (
+                (float(result.get("stop_loss") or new_stop) - entry) / entry
+                if side == "long"
+                else (entry - float(result.get("stop_loss") or new_stop)) / entry
+            )
+            self._log(
+                "trail",
+                symbol=symbol,
+                detail={
+                    "reason": "trailing_stop",
+                    "side": side,
+                    "gain_pct": _json_num(gain),
+                    "best_close": _json_num(best),
+                    "old_stop": _json_num(old_stop),
+                    "new_stop": _json_num(result.get("stop_loss")),
+                    "locked_in_pct": _json_num(locked),
+                    "explanation": (
+                        f"{symbol} {side} is up {gain:.2%} — trailing stop "
+                        f"raised to ${float(result.get('stop_loss') or new_stop):,.6g} "
+                        f"(locks in {locked:+.2%}); take-profit removed so the "
+                        "winner can keep running."
+                    ),
+                },
+            )
+        except Exception:  # noqa: BLE001 — trailing must never break the cycle
+            logger.exception(
+                "Trailing-stop update failed for position %s", position.get("id")
+            )
 
     def _scalper_owned_ids(self) -> set[int]:
         """Position ids owned by the fast scalper script (never raises).

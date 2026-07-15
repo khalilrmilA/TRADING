@@ -215,6 +215,16 @@ class ScalperParamsUpdate(BaseModel):
             "by set_params."
         ),
     )
+    research_mode: bool | None = Field(
+        None,
+        description=(
+            "Data-collection mode: trade EVERY signal on EVERY watchlist "
+            "coin — soft daily stop, bench lists, side-bias, regime gate and "
+            "cost gate are all bypassed and the AI tuner is paused (config "
+            "frozen). Exits and HARD_BOUNDS still apply. USER-ONLY knob "
+            "(not AI-tunable). PAPER TRADING ONLY."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -380,6 +380,13 @@ class ScalperParams(BaseModel):
             least this multiple of the round-trip fee+slippage cost, else the
             scalp is skipped (``0`` disables the gate). User-only (not
             AI-tunable).
+        research_mode: Data-collection mode — trade EVERY signal on EVERY
+            watchlist coin: skips the soft daily stop, the disabled/benched
+            symbol filters, the coach side-bias filter, the regime gate and
+            the cost gate, and pauses the AI tuner (config frozen). Exits
+            (SL/TP/time-stop) and HARD_BOUNDS still fully apply; the
+            engine's hard daily halt remains the last-resort backstop.
+            User-only (not AI-tunable). PAPER TRADING ONLY.
     """
 
     enabled: bool = False
@@ -398,6 +405,7 @@ class ScalperParams(BaseModel):
     disabled_symbols: list[str] = Field(default_factory=list)
     use_atr_geometry: bool = True
     cost_gate_multiple: float = 3.0
+    research_mode: bool = False
 
     @field_validator("timeframe")
     @classmethod
@@ -645,9 +653,14 @@ class Scalper:
         benched = {s for s, entry in playbook.items() if entry.get("bench")}
         if benched:
             logger.debug("Scalper: coach-benched symbols filtered: %s", sorted(benched))
-        watchlist = [
-            s for s in bot_config.watchlist if s not in disabled and s not in benched
-        ]
+        if params.research_mode:
+            # Research mode: every watchlist coin stays in play — the AI
+            # tuner's bench list and the coach's bench are both ignored.
+            watchlist = list(bot_config.watchlist)
+        else:
+            watchlist = [
+                s for s in bot_config.watchlist if s not in disabled and s not in benched
+            ]
         source = bot_config.source
 
         # --- 2) manage own positions (engine SL/TP tick + time-stop) --------
@@ -673,7 +686,7 @@ class Scalper:
                     ),
                 },
             )
-        elif RiskManager.soft_daily_stop_active(
+        elif not params.research_mode and RiskManager.soft_daily_stop_active(
             float(portfolio.get("equity") or 0.0),
             float(portfolio.get("realized_pnl_today") or 0.0),
             settings.daily_loss_limit,
@@ -1146,8 +1159,9 @@ class Scalper:
             logger.debug("Scalper: no entry signal on %s", symbol)
             return False
         bias = str((playbook.get(symbol) or {}).get("side_bias") or "both")
-        if (direction == "long" and bias == "short_only") or (
-            direction == "short" and bias == "long_only"
+        if not params.research_mode and (
+            (direction == "long" and bias == "short_only")
+            or (direction == "short" and bias == "long_only")
         ):
             logger.debug(
                 "Scalper: %s %s entry filtered by coach side_bias=%s",
@@ -1156,6 +1170,22 @@ class Scalper:
                 bias,
             )
             return False
+
+        if params.research_mode:
+            # Research mode: regime gate, cost gate and side-bias are all
+            # bypassed — every fired signal becomes a trade so the results
+            # can be studied later. Exits still manage every position.
+            return self._enter_one(
+                params,
+                symbol,
+                source,
+                direction,
+                values,
+                counters,
+                playbook,
+                atr_14=self._last_atr(last),
+                frame=df,
+            )
 
         # --- v3 gate 1: market regime (shared predicate with the bot) --------
         symbol_info = self._regime_for(regime_cache, source, symbol)
@@ -1788,6 +1818,24 @@ class Scalper:
                 },
             )
             return {"applied": {}, "reasoning": "", "status": "disabled"}
+
+        if params.research_mode:
+            # Research mode freezes the config: the tuner must not shrink
+            # params or bench coins while the user is collecting unfiltered
+            # trade data.
+            logger.info("AI tune skipped — research mode freezes the config")
+            self._log(
+                "scalp_skip",
+                detail={
+                    "reason": "research_mode",
+                    "explanation": (
+                        "AI tune skipped: research mode is on — the "
+                        "configuration is frozen while unfiltered trade "
+                        "data is being collected."
+                    ),
+                },
+            )
+            return {"applied": {}, "reasoning": "", "status": "research_mode"}
 
         # AI-offline tune skip (v3): the Ollama watchdog owns the persisted
         # 'ollama_status'; a MISSING or malformed value means ONLINE (a

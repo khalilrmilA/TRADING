@@ -1509,3 +1509,22 @@ Bot-only (scalper untouched — its fixed TP/SL + time-stop remain tuner territo
 - `BotConfig` gains `trailing_enabled: bool = True`, `trail_activate_pct: float = 0.02` (clamp [0.005, 0.2]), `trail_distance_pct: float = 0.015` (clamp [0.005, 0.1]); exposed via `BotConfigUpdate`.
 - `PaperTradingEngine.update_protective_levels(position_id, stop_loss=None, clear_take_profit=False)` — TIGHTEN-ONLY: a long's stop may only move up, a short's only down; loosening proposals are silently ignored (`stop_moved` reports the outcome). `clear_take_profit=True` sets `take_profit` NULL. Raises ValueError on unknown/closed positions.
 - `AutoTrader._update_trailing(config, position, df)` runs from `_manage_positions` for every surviving (non-flipped) bot position: activation at `gain >= trail_activate_pct` (close-based), stop = best CLOSE since entry ± `trail_distance_pct` (closes, not wicks), take-profit cleared on activation, `trail` activity row (reason `trailing_stop`, plain-English explanation with locked-in %) logged only when the stop actually moves. Never raises; scalper-owned ids never reach it.
+
+## Scalper Research Mode (data collection, 2026-07-15)
+
+`ScalperParams` gains `research_mode: bool = False` — USER-ONLY (never in `_TUNABLE_PARAMS`),
+exposed via `ScalperParamsUpdate.research_mode`. PAPER TRADING ONLY. When True:
+
+- **Watchlist**: every `bot_config.watchlist` coin is scanned — `disabled_symbols` and the
+  coach's `bench` are both ignored (lists preserved, just not applied).
+- **Entry gates bypassed**: soft daily stop, coach `side_bias`, regime gate and cost gate are
+  all skipped — every fired `_entry_signal` goes straight to `_enter_one`. The mechanical
+  signal itself (EMA12/26 trend + RSI band + VWAP side + `allowed_sides`) still decides
+  direction; nothing is inverted or randomized.
+- **AI tuner paused**: `tune_with_ai` returns `{"status": "research_mode", "applied": {}}`
+  and logs a `scalp_skip` row (reason `research_mode`) — the config is frozen during the
+  experiment.
+- **Still enforced**: `HARD_BOUNDS` clamping, SL/TP/time-stop exits, per-symbol cooldown,
+  `max_trades_per_day`, `max_positions`, RiskManager order-level checks and the engine's hard
+  daily-loss halt (`DAILY_LOSS_LIMIT`, raised 0.03 → 0.20 in `.env` on 2026-07-15 as the
+  research backstop). Stops can NEVER be disabled, research mode included.

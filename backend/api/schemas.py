@@ -155,6 +155,17 @@ class BotConfigUpdate(BaseModel):
         None,
         description="Trail distance behind the best close. Not range-checked here — BotConfig clamps to [0.005, 0.1].",
     )
+    research_mode: bool | None = Field(
+        None,
+        description=(
+            "Data-collection mode (mirrors the scalper's flag): every "
+            "shortlisted ensemble signal is entered — coach bench, playbook "
+            "overrides, regime gate, cost gate, news veto, AI gate, second "
+            "judge and the v3 heat/direction pre-submit caps are bypassed. "
+            "Exits and engine-level checks still apply. USER-ONLY. PAPER "
+            "TRADING ONLY."
+        ),
+    )
     use_second_judge: bool | None = Field(
         None, description="Require the finance-specialist second judge to agree before entering."
     )

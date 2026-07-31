@@ -402,6 +402,14 @@ class BotConfig(BaseModel):
             least this multiple of the round-trip fee+slippage cost or the
             candidate is skipped before any AI call. Clamped to [0.0, 10.0]
             on every update; 0 disables the gate.
+        research_mode: Data-collection mode (mirrors the scalper's flag):
+            every shortlisted ensemble signal is entered — the coach bench,
+            playbook overrides, regime gate, cost gate, news-sentiment veto,
+            AI gate, second judge and the v3 heat/direction pre-submit caps
+            are all bypassed; the shortlist is no longer capped by
+            ``max_ai_calls_per_cycle``. Exits (SL/TP, trailing, ensemble
+            flips), engine-level order checks and the hard daily halt still
+            apply. USER-ONLY. PAPER TRADING ONLY.
     """
 
     watchlist: list[str] = Field(default_factory=lambda: list(_DEFAULT_WATCHLIST))
@@ -424,6 +432,7 @@ class BotConfig(BaseModel):
     trailing_enabled: bool = True
     trail_activate_pct: float = 0.02
     trail_distance_pct: float = 0.015
+    research_mode: bool = False
 
     @field_validator("trail_activate_pct")
     @classmethod
@@ -743,7 +752,7 @@ class AutoTrader:
         candidates: list[dict[str, Any]] = []
         for symbol in config.watchlist:
             entry = playbook.get(symbol)
-            if entry is not None and entry.get("bench"):
+            if entry is not None and entry.get("bench") and not config.research_mode:
                 counters["skipped"] += 1
                 self._log(
                     "skip",
@@ -1451,11 +1460,17 @@ class AutoTrader:
         playbook = playbook or {}
 
         def _required_vote(candidate: dict[str, Any]) -> int:
+            if config.research_mode:
+                # Research mode: playbook overrides are ignored — only the
+                # user-set min_vote applies.
+                return config.min_vote
             entry = playbook.get(candidate["symbol"]) or {}
             override = entry.get("min_vote_override")
             return int(override) if override else config.min_vote
 
         def _side_allowed(candidate: dict[str, Any]) -> bool:
+            if config.research_mode:
+                return candidate["vote_sum"] > 0 or config.allow_short
             entry = playbook.get(candidate["symbol"]) or {}
             bias = str(entry.get("side_bias") or "both")
             if candidate["vote_sum"] > 0:
@@ -1488,7 +1503,11 @@ class AutoTrader:
         free_slots = max(
             0, settings.max_open_positions - int(portfolio.get("open_positions") or 0)
         )
-        cap = min(free_slots, config.max_ai_calls_per_cycle) if config.use_ai else free_slots
+        cap = (
+            min(free_slots, config.max_ai_calls_per_cycle)
+            if config.use_ai and not config.research_mode
+            else free_slots
+        )
         return eligible[:cap]
 
     def _confirm_candidate(
@@ -1550,6 +1569,12 @@ class AutoTrader:
         # (works even when the regime gate is disabled).
         symbol_info = self._regime_cached(config, symbol, regime_cache)
         candidate["htf_context"] = _htf_context(symbol_info)
+
+        if config.research_mode:
+            # Research mode: regime gate, cost gate, news veto and AI gate
+            # are all bypassed — every shortlisted ensemble signal becomes a
+            # trade so the results can be studied later.
+            return True
 
         # 1) REGIME hard gate — above the ensemble result, before any AI call.
         if config.regime_gate_enabled:
@@ -1750,6 +1775,8 @@ class AutoTrader:
         Returns:
             True when the judge pass must run for the surviving candidates.
         """
+        if config.research_mode:
+            return False
         if not (config.use_ai and config.use_second_judge):
             return False
         model = config.second_judge_model
@@ -2050,19 +2077,24 @@ class AutoTrader:
         # Pre-submit risk check with FULL order context (contract v3): the
         # engine's own check_order call has no price/stop, so the portfolio
         # heat cap and the direction cap are enforced here, where the stop
-        # distance is known.
-        check = self.risk.check_order(
-            portfolio,
-            self.engine.get_positions("open"),
-            side=side,
-            qty=qty,
-            symbol=symbol,
-            source=config.source,
-            timeframe=config.timeframe,
-            price=price,
-            stop_loss=stop_loss,
-        )
-        if not check.allowed:
+        # distance is known. Research mode skips this pre-check (the engine's
+        # own order-level checks — cash, global position cap, halt — still
+        # run inside submit_order).
+        if config.research_mode:
+            check = None
+        else:
+            check = self.risk.check_order(
+                portfolio,
+                self.engine.get_positions("open"),
+                side=side,
+                qty=qty,
+                symbol=symbol,
+                source=config.source,
+                timeframe=config.timeframe,
+                price=price,
+                stop_loss=stop_loss,
+            )
+        if check is not None and not check.allowed:
             counters["rejected"] += 1
             self._log(
                 "reject",

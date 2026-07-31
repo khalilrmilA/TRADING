@@ -1547,18 +1547,23 @@ class Scalper:
         # stop this entry would use, the RiskManager can enforce the
         # portfolio heat cap and the same-direction cap precisely (the
         # engine's own in-submit check runs degraded, without price/stop).
-        risk_check = self.risk.check_order(
-            portfolio,
-            open_now,
-            side=side,
-            qty=qty,
-            symbol=symbol,
-            source=source,
-            timeframe=params.timeframe,
-            price=price,
-            stop_loss=stop_loss,
-        )
-        if not risk_check.allowed:
+        # Research mode skips this pre-check (submit_order's own cash /
+        # global-cap / halt checks still run).
+        if params.research_mode:
+            risk_check = None
+        else:
+            risk_check = self.risk.check_order(
+                portfolio,
+                open_now,
+                side=side,
+                qty=qty,
+                symbol=symbol,
+                source=source,
+                timeframe=params.timeframe,
+                price=price,
+                stop_loss=stop_loss,
+            )
+        if risk_check is not None and not risk_check.allowed:
             counters["skipped"] += 1
             self._log(
                 "scalp_skip",

@@ -1510,10 +1510,26 @@ Bot-only (scalper untouched — its fixed TP/SL + time-stop remain tuner territo
 - `PaperTradingEngine.update_protective_levels(position_id, stop_loss=None, clear_take_profit=False)` — TIGHTEN-ONLY: a long's stop may only move up, a short's only down; loosening proposals are silently ignored (`stop_moved` reports the outcome). `clear_take_profit=True` sets `take_profit` NULL. Raises ValueError on unknown/closed positions.
 - `AutoTrader._update_trailing(config, position, df)` runs from `_manage_positions` for every surviving (non-flipped) bot position: activation at `gain >= trail_activate_pct` (close-based), stop = best CLOSE since entry ± `trail_distance_pct` (closes, not wicks), take-profit cleared on activation, `trail` activity row (reason `trailing_stop`, plain-English explanation with locked-in %) logged only when the stop actually moves. Never raises; scalper-owned ids never reach it.
 
-## Scalper Research Mode (data collection, 2026-07-15)
+## Research Mode (data collection, 2026-07-15) — scalper AND bot
 
-`ScalperParams` gains `research_mode: bool = False` — USER-ONLY (never in `_TUNABLE_PARAMS`),
-exposed via `ScalperParamsUpdate.research_mode`. PAPER TRADING ONLY. When True:
+### Bot (`BotConfig.research_mode: bool = False`, via `BotConfigUpdate.research_mode`)
+
+USER-ONLY. When True, every shortlisted ensemble signal is entered:
+
+- Coach `bench` skipped in the cycle loop; playbook `min_vote_override`/`side_bias` ignored in
+  `_shortlist`; the shortlist cap ignores `max_ai_calls_per_cycle` (free slots only).
+- `_confirm_candidate` returns True immediately after computing `htf_context` — regime gate,
+  cost gate, news-sentiment veto and the primary AI gate are all bypassed.
+- `_second_judge_ready` returns False (no judge pass).
+- `_enter_candidate` skips the full-context `risk.check_order` pre-check (heat cap + direction
+  cap); the engine's own `submit_order` checks (cash, global position cap, halt) still run.
+- Still enforced: `min_vote` (user-set), `allow_short`, SL/TP + trailing exits, ensemble-flip
+  exits, the engine hard daily halt.
+
+### Scalper (`ScalperParams.research_mode: bool = False`)
+
+USER-ONLY (never in `_TUNABLE_PARAMS`), exposed via `ScalperParamsUpdate.research_mode`.
+PAPER TRADING ONLY. When True:
 
 - **Watchlist**: every `bot_config.watchlist` coin is scanned — `disabled_symbols` and the
   coach's `bench` are both ignored (lists preserved, just not applied).
@@ -1524,7 +1540,10 @@ exposed via `ScalperParamsUpdate.research_mode`. PAPER TRADING ONLY. When True:
 - **AI tuner paused**: `tune_with_ai` returns `{"status": "research_mode", "applied": {}}`
   and logs a `scalp_skip` row (reason `research_mode`) — the config is frozen during the
   experiment.
+- **Pre-submit risk check skipped**: `_enter_one` skips the full-context `risk.check_order`
+  pre-check (heat cap + same-direction cap); `submit_order`'s own cash / global-cap / halt
+  checks still run.
 - **Still enforced**: `HARD_BOUNDS` clamping, SL/TP/time-stop exits, per-symbol cooldown,
-  `max_trades_per_day`, `max_positions`, RiskManager order-level checks and the engine's hard
+  `max_trades_per_day`, `max_positions`, engine order-level checks and the engine's hard
   daily-loss halt (`DAILY_LOSS_LIMIT`, raised 0.03 → 0.20 in `.env` on 2026-07-15 as the
   research backstop). Stops can NEVER be disabled, research mode included.

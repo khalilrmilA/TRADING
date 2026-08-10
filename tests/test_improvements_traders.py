@@ -613,7 +613,7 @@ def test_botconfig_v3_defaults_and_clamps() -> None:
     """New config fields default per contract; cost_gate_multiple clamps [0, 10]."""
     cfg = BotConfig()
     assert cfg.regime_gate_enabled is True
-    assert cfg.cost_gate_multiple == pytest.approx(3.0)
+    assert cfg.cost_gate_multiple == pytest.approx(4.0)
 
     _, trader = _make_trader()
     assert trader.set_config({"cost_gate_multiple": 99.0}).cost_gate_multiple == pytest.approx(10.0)

@@ -55,6 +55,10 @@ def _contract_capital(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     the developer's environment.
     """
     monkeypatch.setattr(settings, "initial_capital", 100_000.0)
+    monkeypatch.setattr(settings, "daily_loss_limit", 0.03)
+    monkeypatch.setattr(settings, "circuit_breaker_drawdown", 0.10)
+    monkeypatch.setattr(settings, "heat_cap_fraction", 0.06)
+    monkeypatch.setattr(settings, "max_same_direction", 5)
     yield
 
 

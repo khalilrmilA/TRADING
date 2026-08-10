@@ -417,18 +417,18 @@ class BotConfig(BaseModel):
     timeframe: str = "1h"
     interval_minutes: int = Field(15, ge=1)
     use_ai: bool = True
-    min_ai_confidence: int = Field(60, ge=0, le=100)
-    max_ai_calls_per_cycle: int = Field(3, ge=0)
+    min_ai_confidence: int = Field(70, ge=0, le=100)
+    max_ai_calls_per_cycle: int = Field(2, ge=0)
     allow_short: bool = False
-    min_vote: int = Field(2, ge=1, le=4)
-    max_position_fraction: float = Field(0.35, gt=0.0, le=1.0)
+    min_vote: int = Field(3, ge=1, le=4)
+    max_position_fraction: float = Field(0.25, gt=0.0, le=1.0)
     running: bool = False
     use_second_judge: bool = True
     second_judge_model: str = "mychen76/Fin-R1:Q5"
     judge_min_confidence: int = Field(55, ge=0, le=100)
     sentiment_rank_weight: float = 0.5
     regime_gate_enabled: bool = True
-    cost_gate_multiple: float = 3.0
+    cost_gate_multiple: float = 4.0
     trailing_enabled: bool = True
     trail_activate_pct: float = 0.02
     trail_distance_pct: float = 0.015
@@ -1486,6 +1486,12 @@ class AutoTrader:
                 )
                 candidate["sentiment_bonus"] = bonus
             score = abs(candidate["vote_sum"]) + float(bonus)
+            if candidate["vote_sum"] != 0:
+                target_direction = 1 if candidate["vote_sum"] > 0 else -1
+                if candidate["votes"].get("mean_reversion") == target_direction:
+                    # Prefer candidates where the historically stronger
+                    # mean-reversion strategy agrees with the ensemble.
+                    score += 0.5
             candidate["rank_score"] = score
             return score
 

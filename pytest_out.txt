@@ -1,0 +1,26 @@
+﻿........................................................................ [ 21%]
+........................................................................ [ 43%]
+........................................................................ [ 64%]
+..........................................................F............. [ 86%]
+..............................................                           [100%]
+================================== FAILURES ===================================
+________________ test_check_order_rejects_on_daily_loss_limit _________________
+
+    def test_check_order_rejects_on_daily_loss_limit() -> None:
+        # -4% on the day (limit is -3%); drawdown kept below the circuit breaker.
+        portfolio = _portfolio(
+            equity=96_000.0,
+            realized_pnl_today=-4_000.0,
+            unrealized_pnl=0.0,
+            daily_pnl_pct=-0.04,
+            peak_equity=100_000.0,
+            drawdown=0.04,
+        )
+        result = RiskManager().check_order(portfolio, [])
+>       assert result.allowed is False
+E       AssertionError: assert True is False
+E        +  where True = RiskCheckResult(allowed=True, reason='ok').allowed
+
+tests\test_risk.py:76: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_risk.py::test_check_order_rejects_on_daily_loss_limit - Ass...

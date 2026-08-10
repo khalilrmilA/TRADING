@@ -649,11 +649,11 @@ def test_config_roundtrip_persistence() -> None:
     # Contract defaults.
     cfg = trader.get_config()
     assert isinstance(cfg, BotConfig)
-    assert cfg.min_vote == 2
+    assert cfg.min_vote == 3
     assert cfg.use_ai is True
-    assert cfg.min_ai_confidence == 60
+    assert cfg.min_ai_confidence == 70
     assert cfg.allow_short is False
-    assert cfg.max_position_fraction == pytest.approx(0.35)
+    assert cfg.max_position_fraction == pytest.approx(0.25)
     assert cfg.running is False
     assert len(cfg.watchlist) == 10 and "BTCUSDT" in cfg.watchlist
 

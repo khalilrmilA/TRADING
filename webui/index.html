@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Paper Trader</title>
+<script src="/ui/plotly.min.js"></script>
+<style>
+  /* ---- role tokens (validated dark palette) ---- */
+  :root {
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --surface-2:   #232322;
+    --ink:         #ffffff;
+    --ink-2:       #c3c2b7;
+    --ink-muted:   #898781;
+    --grid:        #2c2c2a;
+    --hairline:    rgba(255,255,255,0.10);
+    --up:          #0ca30c;   /* status good  — 5.19:1 on surface */
+    --down:        #d03b3b;   /* status critical — 3.62:1 on surface */
+    --warn:        #fab219;
+    --accent:      #3987e5;   /* series-1 blue (dark step) */
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--page); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px; line-height: 1.45; padding-bottom: 60px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 14px 22px; border-bottom: 1px solid var(--hairline);
+    position: sticky; top: 0; background: rgba(13,13,13,.92); backdrop-filter: blur(6px); z-index: 20;
+  }
+  header h1 { font-size: 19px; font-weight: 650; }
+  .badge {
+    font-size: 11px; font-weight: 700; letter-spacing: .5px; padding: 3px 9px;
+    border-radius: 20px; border: 1px solid var(--hairline); color: var(--ink-2);
+  }
+  .badge.paper { color: var(--warn); border-color: rgba(250,178,25,.4); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-muted); }
+  .dot.on  { background: var(--up); box-shadow: 0 0 6px rgba(12,163,12,.7); }
+  .dot.off { background: var(--down); }
+  header .spacer { flex: 1; }
+
+  button {
+    font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+    border-radius: 9px; padding: 8px 16px; border: 1px solid var(--hairline);
+    background: var(--surface-2); color: var(--ink); transition: filter .15s;
+  }
+  button:hover { filter: brightness(1.2); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--up); border-color: transparent; color: #fff; }
+  button.danger  { background: transparent; border-color: rgba(208,59,59,.55); color: #e66767; }
+  button.blue    { background: var(--accent); border-color: transparent; color: #fff; }
+  button.ghost   { background: transparent; color: var(--ink-2); }
+
+  .banner { margin: 14px 22px 0; padding: 11px 16px; border-radius: var(--radius); font-size: 14px; display: none; }
+  .banner.err  { display: block; background: rgba(208,59,59,.12); border: 1px solid rgba(208,59,59,.45); }
+  .banner.warn { display: block; background: rgba(250,178,25,.10); border: 1px solid rgba(250,178,25,.4); }
+
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 18px 22px; }
+
+  /* KPI tiles */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .tile .lbl { font-size: 12px; color: var(--ink-muted); font-weight: 600; letter-spacing: .3px; text-transform: uppercase; }
+  .tile .val { font-size: 26px; font-weight: 700; margin-top: 3px; }
+  .tile .sub { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
+  .tile.hero .val { font-size: 34px; }
+  .pos { color: var(--up); } .neg { color: #e66767; } .flat { color: var(--ink-2); }
+
+  .grid { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 14px; }
+  @media (min-width: 1080px) { .grid { grid-template-columns: minmax(0, 1.72fr) minmax(0, 1fr); } }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--radius);
+    padding: 16px; min-width: 0;
+  }
+  .card h2 { font-size: 15px; font-weight: 650; color: var(--ink-2); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .card h2 .right { margin-left: auto; font-size: 12.5px; color: var(--ink-muted); font-weight: 500; }
+
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    font-size: 12.5px; font-weight: 600; padding: 4px 11px; border-radius: 18px;
+    border: 1px solid var(--hairline); color: var(--ink-2); cursor: pointer; background: transparent;
+  }
+  .chip.sel { background: var(--accent); border-color: transparent; color: #fff; }
+  .chip.up { color: var(--up); border-color: rgba(12,163,12,.45); }
+  .chip.dn { color: #e66767; border-color: rgba(208,59,59,.45); }
+  #sentChips .chip.sel { background: var(--surface-2); }
+
+  .plot { width: 100%; }
+  #candles { height: 430px; } #equity { height: 210px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th { text-align: left; color: var(--ink-muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; font-weight: 650; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+  td { padding: 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  .empty { color: var(--ink-muted); padding: 18px 6px; text-align: center; font-size: 13.5px; }
+
+  /* activity feed */
+  #feed { max-height: 640px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+  .evt { border: 1px solid transparent; border-radius: 9px; padding: 7px 10px; font-size: 13.5px; color: var(--ink-2); }
+  .evt.click { cursor: pointer; } .evt.click:hover { background: var(--surface-2); }
+  .evt .row1 { display: flex; gap: 8px; align-items: baseline; }
+  .evt .sym { font-weight: 700; color: var(--ink); }
+  .evt .when { margin-left: auto; color: var(--ink-muted); font-size: 11.5px; white-space: nowrap; }
+  .evt.enter, .evt.scalp_enter { border-color: rgba(12,163,12,.35); background: rgba(12,163,12,.07); }
+  .evt.exit, .evt.scalp_exit   { border-color: rgba(208,59,59,.35); background: rgba(208,59,59,.07); }
+  .evt.scalp_tune, .evt.coach_tune { border-color: rgba(57,135,229,.35); background: rgba(57,135,229,.06); }
+  .evt .why { margin-top: 3px; color: var(--ink-2); }
+  .evt .detail { display: none; margin-top: 8px; border-top: 1px solid var(--grid); padding-top: 8px; }
+  .evt.open .detail { display: block; }
+  .votechips { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
+  .vote { font-size: 11.5px; font-weight: 700; padding: 2px 8px; border-radius: 12px; border: 1px solid var(--hairline); }
+  .vote.up { color: var(--up); border-color: rgba(12,163,12,.4); }
+  .vote.dn { color: #e66767; border-color: rgba(208,59,59,.4); }
+  .indgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 6px; margin: 6px 0; }
+  .ind { background: var(--surface-2); border-radius: 7px; padding: 5px 8px; font-size: 12px; }
+  .ind b { display: block; color: var(--ink-muted); font-size: 10.5px; text-transform: uppercase; font-weight: 650; }
+  .aibox { background: var(--surface-2); border-left: 3px solid var(--accent); border-radius: 6px; padding: 8px 10px; font-size: 12.5px; margin-top: 6px; }
+  .heads { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
+  .heads li { margin-bottom: 3px; }
+  .heads .src { color: var(--ink-muted); font-size: 11px; }
+
+  /* modal */
+  #modalBg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 50; }
+  #modal {
+    display: none; position: fixed; z-index: 51; inset: 5vh 50% auto auto; transform: translateX(50%);
+    right: 50%; width: min(760px, 92vw); max-height: 88vh; overflow-y: auto;
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 14px; padding: 26px 30px;
+  }
+  #modal h3 { font-size: 20px; margin-bottom: 4px; }
+  #modal h4 { font-size: 15px; margin: 18px 0 6px; color: var(--accent); }
+  #modal p, #modal li { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
+  #modal ul { padding-left: 20px; }
+  #modal .close { position: sticky; top: 0; float: right; }
+  #modal code { background: var(--surface-2); border-radius: 5px; padding: 1px 6px; font-size: 13px; }
+
+  footer { margin: 26px 22px; font-size: 12.5px; color: var(--ink-muted); text-align: center; }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: sp 0.8s linear infinite; vertical-align: -2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🤖 AI Paper Trader</h1>
+  <span class="badge paper">PAPER — NOT REAL MONEY</span>
+  <span class="pill"><span id="apiDot" class="dot"></span> API</span>
+  <span class="pill"><span id="botDot" class="dot"></span> <span id="botState">Bot</span></span>
+  <div class="spacer"></div>
+  <button id="btnStart" class="primary">▶ Start AI</button>
+  <button id="btnStop" class="danger">⏸ Stop</button>
+  <button id="btnScan" class="blue">⚡ Scan now</button>
+  <button id="btnHow" class="ghost">📖 How it trades</button>
+  <a href="http://localhost:8501" target="_blank"><button class="ghost">Advanced ↗</button></a>
+</header>
+
+<div id="bannerApi" class="banner"></div>
+<div id="bannerAI" class="banner"></div>
+<div id="bannerHalt" class="banner"></div>
+
+<div class="wrap">
+
+  <div class="kpis">
+    <div class="tile hero"><div class="lbl">Account value</div><div class="val" id="kEquity">—</div><div class="sub" id="kEquitySub"></div></div>
+    <div class="tile"><div class="lbl">Total profit</div><div class="val" id="kTotal">—</div><div class="sub">since the $100 start</div></div>
+    <div class="tile"><div class="lbl">Today</div><div class="val" id="kToday">—</div><div class="sub" id="kTodaySub"></div></div>
+    <div class="tile"><div class="lbl">Cash free</div><div class="val" id="kCash">—</div><div class="sub" id="kCashSub"></div></div>
+    <div class="tile"><div class="lbl">Open trades</div><div class="val" id="kPos">—</div><div class="sub" id="kPosSub">&nbsp;</div></div>
+    <div class="tile"><div class="lbl">Next AI check</div><div class="val" id="kNext" style="font-size:20px">—</div><div class="sub" id="kNextSub"></div></div>
+  </div>
+
+  <div class="grid">
+    <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+      <div class="card">
+        <h2>Price chart
+          <span class="chips" id="coinChips"></span>
+          <span class="chips" id="tfChips" style="margin-left:auto"></span>
+        </h2>
+        <div id="candles" class="plot"></div>
+        <div style="font-size:12px;color:var(--ink-muted)">▲ = bot bought here &nbsp;·&nbsp; ▼ = bot sold here &nbsp;·&nbsp; green candle = price went up, red = down</div>
+      </div>
+
+      <div class="card">
+        <h2>Your $100 over time <span class="right" id="eqMeta"></span></h2>
+        <div id="equity" class="plot"></div>
+      </div>
+
+      <div class="card" id="intelCard" style="display:none">
+        <h2>🌍 Market intelligence
+          <span class="pill" style="font-size:12px"><span id="intelDot" class="dot"></span> <span id="intelState">off</span></span>
+          <span class="right" style="display:flex;gap:8px;align-items:center">
+            <button id="btnIntelRefresh" class="ghost" style="padding:4px 12px;font-size:12.5px">🔄 Refresh now</button>
+            <button id="intelOn" class="primary" style="padding:4px 12px;font-size:12.5px">▶ Enable</button>
+            <button id="intelOff" class="danger" style="padding:4px 12px;font-size:12.5px;display:none">⏸ Disable</button>
+          </span>
+        </h2>
+        <div style="display:flex;gap:8px;align-items:stretch;flex-wrap:wrap;margin-bottom:10px">
+          <div class="ind" style="flex:0 0 auto;min-width:150px;padding:7px 10px"><b>Fear &amp; Greed</b><span id="fngVal" style="color:var(--ink-muted)">—</span></div>
+          <div class="ind" style="flex:1;min-width:230px;padding:7px 10px"><b>Global mood</b><span id="intelMood" style="color:var(--ink-muted)">—</span></div>
+        </div>
+        <div class="chips" id="sentChips"></div>
+        <div id="sentDetail" style="display:none"></div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:14px;border-top:1px solid var(--grid);padding-top:10px">
+          <b style="font-size:14px;color:var(--ink-2)">📒 Coach playbook</b>
+          <button id="btnCoach" class="ghost" style="margin-left:auto;padding:3px 10px;font-size:12px">🎓 Run coach now</button>
+        </div>
+        <div id="playbook" style="margin-top:8px;display:flex;flex-direction:column;gap:4px"></div>
+        <div style="font-size:11.5px;color:var(--ink-muted);margin-top:8px">News &amp; community mood from public sources (Google News, Reddit, Fear &amp; Greed index), scored by the local AI. The coach reviews every coin's finished trades and adapts a per-coin playbook — both feed the traders. Research only, not financial advice.</div>
+      </div>
+
+      <div class="card">
+        <h2>Open trades</h2>
+        <div style="overflow-x:auto"><table id="tblPos"></table></div>
+      </div>
+
+      <div class="card">
+        <h2>Finished trades <span class="right">most recent first</span></h2>
+        <div style="overflow-x:auto"><table id="tblClosed"></table></div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:14px;min-width:0;align-self:start">
+      <div class="card" id="scalpCard" style="display:none">
+        <h2>⚡ Fast script
+          <span class="pill" style="font-size:12px"><span id="scalpDot" class="dot"></span> <span id="scalpState">off</span></span>
+          <span class="right" style="display:flex;gap:8px">
+            <button id="scalpOn" class="primary" style="padding:4px 12px;font-size:12.5px">▶ Enable</button>
+            <button id="scalpOff" class="danger" style="padding:4px 12px;font-size:12.5px;display:none">⏸ Disable</button>
+          </span>
+        </h2>
+        <div id="scalpRule" style="font-size:13px;color:var(--ink-2);margin-bottom:10px"></div>
+        <div class="indgrid" id="scalpStats" style="margin:0 0 10px"></div>
+        <div class="aibox" style="margin-top:0">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <b>🤖 AI supervisor</b>
+            <span id="scalpTuneWhen" style="color:var(--ink-muted);font-size:12px">—</span>
+            <button id="btnTune" class="ghost" style="margin-left:auto;padding:3px 10px;font-size:12px">🛠️ Tune now</button>
+          </div>
+          <div id="scalpTuneInfo" style="margin-top:6px"></div>
+        </div>
+        <div style="font-size:11.5px;color:var(--ink-muted);margin-top:8px">A simple rules-only scalper — no AI in the trade loop. The AI supervisor reviews its results every hour and re-tunes it within hard safety limits. Disabling closes its open trades.</div>
+      </div>
+
+      <div class="card">
+        <h2>🧠 What the AI is doing
+          <label class="right" style="cursor:pointer;user-select:none">
+            <input type="checkbox" id="showScans"> show scans
+          </label>
+        </h2>
+        <div id="feed"><div class="empty">No activity yet — press <b>▶ Start AI</b> or <b>⚡ Scan now</b>.</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="modalBg" onclick="hideModal()"></div>
+<div id="modal">
+  <button class="close ghost" onclick="hideModal()">✕ Close</button>
+  <h3>📖 How the AI trades</h3>
+  <p>Everything here is <b>simulated</b> with $100 of play money. Nothing is real, ever.</p>
+
+  <h4>Step 1 — It reads the charts with 4 classic methods</h4>
+  <ul>
+    <li><b>Trend following</b> — buys when the fast average (EMA 12) rises above the slow one (EMA 26) and price is above its 50-bar average → the market is trending up. Sells on the opposite.</li>
+    <li><b>Mean reversion</b> — buys when price falls below the lower Bollinger Band while RSI &lt; 30 (oversold: "stretched too far down, likely to bounce"). Takes profit when price returns to the middle band.</li>
+    <li><b>Breakout</b> — buys when price breaks above the highest point of the last 20 bars with strong volume (1.5× average) → new momentum starting.</li>
+    <li><b>RSI + MACD confirmation</b> — buys when MACD crosses up <i>and</i> RSI &gt; 50, so two independent momentum signals agree.</li>
+  </ul>
+
+  <h4>Step 2 — The strategies vote</h4>
+  <p>Each method votes <b>up</b>, <b>down</b> or <b>neutral</b> on every coin. A coin is only considered when <b>at least 2 of the 4 agree</b> on the same direction. The strongest setups are ranked first.</p>
+
+  <h4>Step 3 — The local AI confirms</h4>
+  <p>The best candidates are shown to <code>qwen3:14b</code> (running on your GPU) with the full chart picture: trend direction, distance to recent highs/lows (support &amp; resistance), RSI, MACD, volatility and volume. The AI answers <i>bullish / bearish / neutral</i> with a confidence score and written reasoning. The bot only buys when the AI <b>agrees</b> with the vote at <b>≥ 60% confidence</b>. You can read the AI's reasoning on every trade in the feed.</p>
+
+  <h4>Step 4 — Position size is based on risk, not gut feeling</h4>
+  <p>Size is computed from the coin's volatility (ATR) so that if the stop-loss is hit, you lose about <b>$1 (1%)</b> of the account: <code>size = (equity × 1%) ÷ (2 × ATR)</code>, and never more than 35% of the account in one coin.</p>
+
+  <h4>Step 5 — Every trade has an exit plan before it starts</h4>
+  <ul>
+    <li><b>Stop-loss</b> at entry − 2×ATR — cuts the loss automatically if the chart turns.</li>
+    <li><b>Take-profit</b> at entry + 3×ATR — locks the win at 1.5× the risk.</li>
+    <li>The bot also exits early if the strategy votes flip against the trade.</li>
+  </ul>
+
+  <h4>Safety rules (always on)</h4>
+  <ul>
+    <li>Max <b>1% risk</b> per trade · max <b>5 open trades</b> · max <b>35%</b> of the account per coin</li>
+    <li>Trading pauses for the day after <b>−3%</b> daily loss</li>
+    <li><b>Circuit breaker</b>: everything halts if the account drops 10% from its peak</li>
+  </ul>
+
+  <h4>Reading the candles yourself</h4>
+  <p>Each candle = one hour. <span class="pos">Green</span> body: price closed higher than it opened. <span class="neg">Red</span>: it closed lower. The thin wicks show the highest and lowest price of that hour. The blue line on the equity chart is your $100 — up and to the right is the goal 😉.</p>
+</div>
+
+<footer>
+  ⚠️ PAPER TRADING ONLY — this is a research simulator. No real orders, no exchange keys, not financial advice.
+  &nbsp;·&nbsp; <a href="#" onclick="resetAccount();return false">Reset account to $100</a>
+</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const state = { coin: "BTCUSDT", tf: "1h", coins: ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT"],
+                botAvailable: true, scanning: false, feedOpen: new Set(), intelOpen: null, intelData: null };
+const TFS = ["15m","1h","4h","1d"];
+
+const money = v => {
+  if (v==null||isNaN(v)) return "—";
+  const n = Number(v);
+  // Meme-coin prices (PEPE ~$0.00001) need significant digits, not 2 decimals.
+  if (n !== 0 && Math.abs(n) < 0.01) return "$" + n.toPrecision(4);
+  return "$" + n.toLocaleString("en-US",{minimumFractionDigits:2, maximumFractionDigits:2});
+};
+const signMoney = v => (v==null||isNaN(v)) ? "—" : (v>=0?"+":"−") + money(Math.abs(v)).slice(1-0).replace(/^/,"$");
+const pct = v => (v==null||isNaN(v)) ? "" : ((v>=0?"+":"") + (100*v).toFixed(2) + "%");
+const cls = v => v>0.000001 ? "pos" : v<-0.000001 ? "neg" : "flat";
+const qty = v => v==null ? "—" : Number(v).toLocaleString("en-US",{maximumSignificantDigits:6});
+function ago(iso){ if(!iso) return ""; const s=(Date.now()-new Date(iso).getTime())/1000;
+  if(s<60) return Math.max(1,s|0)+"s ago"; if(s<3600) return (s/60|0)+"m ago";
+  if(s<86400) return (s/3600|0)+"h ago"; return new Date(iso).toLocaleString(); }
+
+async function api(path, opts={}) {
+  const r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opts));
+  if (!r.ok) { let d=""; try{ d=(await r.json()).detail||""; }catch(e){} const err = new Error(d||("HTTP "+r.status)); err.status=r.status; throw err; }
+  return r.json();
+}
+
+/* ---------- plot theming ---------- */
+const PL = { paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
+  font:{family:'system-ui,-apple-system,"Segoe UI",sans-serif', color:"#c3c2b7", size:12},
+  margin:{l:52,r:12,t:8,b:34}, dragmode:false, showlegend:false,
+  xaxis:{gridcolor:"#2c2c2a", linecolor:"#383835", zeroline:false, fixedrange:true},
+  yaxis:{gridcolor:"#2c2c2a", linecolor:"#383835", zeroline:false, fixedrange:true} };
+const PCFG = {displayModeBar:false, responsive:true};
+
+/* ---------- KPIs / live ---------- */
+async function refreshLive() {
+  let apiOk = true;
+  try {
+    const p = await api("/api/paper/portfolio");
+    $("kEquity").textContent = money(p.equity);
+    const tot = p.equity - 100;
+    $("kTotal").textContent = (tot>=0?"+":"") + money(Math.abs(tot)).replace("$", tot>=0?"$":"−$");
+    $("kTotal").className = "val " + cls(tot);
+    $("kEquitySub").textContent = p.drawdown!=null ? "peak " + money(p.peak_equity) + " · dip " + (100*p.drawdown).toFixed(1) + "%" : "";
+    const today = (p.realized_pnl_today||0) + 0;
+    $("kToday").textContent = (today>=0?"+":"−") + money(Math.abs(today)).slice(0).replace("$","$");
+    $("kToday").className = "val " + cls(today);
+    $("kTodaySub").textContent = p.daily_pnl_pct!=null ? pct(p.daily_pnl_pct) + " of the day start" : "";
+    $("kCash").textContent = money(p.cash);
+    $("kCashSub").textContent = "invested " + money(Math.max(0, p.equity - p.cash));
+    const maxPos = p.max_open_positions ?? 10;
+    $("kPos").textContent = (p.open_positions ?? "—") + " / " + maxPos;
+    $("kPosSub").textContent = "max " + maxPos + " at once · longs + shorts";
+    const halted = p.trading_halted || p.circuit_breaker_active;
+    const hb = $("bannerHalt");
+    if (halted) { hb.className = "banner warn"; hb.innerHTML = "⚠️ <b>Trading paused:</b> " + (p.halt_reason || "risk limit reached") + " — the AI will not open new trades. Use “Reset account” below to start fresh."; }
+    else hb.className = "banner";
+  } catch(e) { apiOk = false; }
+
+  try {
+    const s = await api("/api/bot/status");
+    state.botAvailable = true;
+    $("botDot").className = "dot " + (s.running ? "on":"off");
+    $("botState").textContent = s.running ? "Bot ON" : "Bot off";
+    $("btnStart").style.display = s.running ? "none":"";
+    $("btnStop").style.display = s.running ? "":"none";
+    if (s.watchlist && s.watchlist.length) { if (JSON.stringify(s.watchlist)!==JSON.stringify(state.coins)) { state.coins = s.watchlist; renderChips(); } }
+    $("kNext").textContent = state.scanning ? "scanning…" : (s.running && s.next_cycle_ts ? new Date(s.next_cycle_ts).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}) : (s.running?"soon":"bot is off"));
+    $("kNextSub").textContent = s.last_cycle_ts ? "last check " + ago(s.last_cycle_ts) : "no scan yet";
+  } catch(e) {
+    if (e.status===404) { state.botAvailable = false; $("botState").textContent = "Bot installing…"; $("botDot").className="dot"; }
+    else if (!apiOk) {}
+  }
+
+  try {
+    const sc = await api("/api/scalper/status");
+    renderScalper(sc);
+    $("scalpCard").style.display = "";
+  } catch(e) {
+    if (e.status===404) $("scalpCard").style.display = "none";   // scalper not installed yet — hide gracefully
+  }
+
+  try {
+    const ist = await api("/api/intel/status");
+    let sent = [], pb = [];
+    try { sent = (await api("/api/intel/sentiment")).items || []; } catch(e){}
+    try { pb = (await api("/api/intel/playbook")).items || []; } catch(e){}
+    renderIntel(ist, sent, pb);
+    $("intelCard").style.display = "";
+  } catch(e) {
+    $("intelCard").style.display = "none";   // intel not installed / API down — hide gracefully
+  }
+
+  const ab = $("bannerApi");
+  if (!apiOk) { ab.className="banner err"; ab.innerHTML = "❌ Cannot reach the trading engine (API on port 8000). Start it with <code>scripts\\start_backend.bat</code>."; $("apiDot").className="dot off"; }
+  else { ab.className="banner"; $("apiDot").className="dot on"; }
+
+  // AI-offline banner: red only when the API answers AND says Ollama is down.
+  const aib = $("bannerAI");
+  let aiOffline = false;
+  if (apiOk) { try { const health = await api("/health"); aiOffline = health.ollama_available === false; } catch(e) {} }
+  if (aiOffline) { aib.className = "banner err"; aib.innerHTML = "🔌 AI offline — the trading brain is unreachable; AI-gated trades are paused. Watchdog is trying to restart it."; }
+  else aib.className = "banner";
+
+  try { renderPositions((await api("/api/paper/positions?status=open")).items||[]); } catch(e){ renderPositions([]); }
+  try { renderClosed((await api("/api/paper/positions?status=closed")).items||[]); } catch(e){ renderClosed([]); }
+  if (state.botAvailable) { try { renderFeed((await api("/api/bot/activity?limit=120")).items||[]); } catch(e){} }
+}
+
+function renderPositions(items){
+  const t = $("tblPos");
+  if (!items.length) { t.innerHTML = '<tr><td class="empty">No open trades. When the AI buys something it appears here with its stop-loss and target.</td></tr>'; return; }
+  let h = "<tr><th>Coin</th><th>Side</th><th>Amount</th><th>Bought at</th><th>Now</th><th>Profit</th><th>Stop</th><th>Target</th><th></th></tr>";
+  for (const p of items){
+    const upnl = p.unrealized_pnl ?? ((p.last_price-p.entry_price)*p.qty*(p.side==="long"?1:-1));
+    const upct = p.entry_price ? upnl/(p.entry_price*p.qty) : null;
+    h += `<tr><td><b>${p.symbol}</b></td><td>${p.side==="long"?"🟢 long":"🔻 short"}</td><td>${qty(p.qty)}</td>
+      <td>${money(p.entry_price)}</td><td>${money(p.last_price)}</td>
+      <td class="${cls(upnl)}">${money(upnl).replace("$", upnl>=0?"+$":"−$").replace("−$-","−$")} <span style="opacity:.75">(${pct(upct)})</span></td>
+      <td>${money(p.stop_loss)}</td><td>${money(p.take_profit)}</td>
+      <td><button class="ghost" style="padding:3px 10px;font-size:12px" onclick="closePos(${p.id})">close</button></td></tr>`;
+  }
+  t.innerHTML = h;
+}
+
+function renderClosed(items){
+  const t = $("tblClosed");
+  items = items.slice(0,25);
+  if (!items.length) { t.innerHTML = '<tr><td class="empty">No finished trades yet.</td></tr>'; return; }
+  let h = "<tr><th>Closed</th><th>Coin</th><th>Side</th><th>Amount</th><th>In → Out</th><th>Result</th></tr>";
+  for (const p of items){
+    h += `<tr><td>${ago(p.closed_at)}</td><td><b>${p.symbol}</b></td><td>${p.side}</td><td>${qty(p.qty)}</td>
+      <td>${money(p.entry_price)} → ${money(p.exit_price)}</td>
+      <td class="${cls(p.pnl)}"><b>${p.pnl>=0?"+":"−"}${money(Math.abs(p.pnl)).slice(1)}</b>${p.pnl>=0?" ✅":" ❌"}</td></tr>`;
+  }
+  t.innerHTML = h;
+}
+
+/* ---------- activity feed ---------- */
+const EMO = {cycle_start:"🔄", scan:"🔍", enter:"✅", exit:"🔴", skip:"⏭️", reject:"🚫", halt:"⚠️", error:"⚠️", cycle_end:"🏁",
+             scalp_enter:"⚡✅", scalp_exit:"⚡🔴", scalp_tune:"🛠️", scalp_skip:"⚡⏭️", coach_tune:"🎓"};
+const VOTE_NAMES = {trend_following:"Trend", mean_reversion:"MeanRev", breakout:"Breakout", rsi_macd:"RSI+MACD"};
+function renderFeed(items){
+  const feed = $("feed"); const showScans = $("showScans").checked;
+  const rows = items.filter(e => showScans || !["scan","cycle_start","cycle_end","scalp_skip"].includes(e.action));
+  if (!rows.length){ feed.innerHTML = '<div class="empty">No activity yet — press <b>▶ Start AI</b> or <b>⚡ Scan now</b>.</div>'; return; }
+  feed.innerHTML = rows.map((e,i) => {
+    const d = e.detail || {};
+    const expandable = ["enter","exit","skip","reject","scalp_enter","scalp_exit","scalp_skip"].includes(e.action);
+    const key = e.ts + "|" + e.symbol + "|" + e.action;
+    const open = state.feedOpen.has(key) ? " open" : "";
+    let why = d.explanation || d.reason || "";
+    if (e.action==="scan") why = `vote ${d.vote_sum>0?"+":""}${d.vote_sum ?? "?"} · RSI ${d.rsi_14!=null?Number(d.rsi_14).toFixed(0):"?"} · ${money(d.price)}`;
+    if (e.action==="cycle_end" && d.equity!=null) why = `scanned ${d.scanned??"?"} coins · ${d.entered??0} buys · ${d.exited??0} exits · account ${money(d.equity)}`;
+    if (e.action==="scalp_tune" || e.action==="coach_tune") why = d.reasoning || why;   // tune rows: reasoning inline
+    let detail = "";
+    if (expandable){
+      const votes = d.votes ? Object.entries(d.votes).map(([k,v]) =>
+        `<span class="vote ${v>0?"up":v<0?"dn":""}">${VOTE_NAMES[k]||k} ${v>0?"↑":v<0?"↓":"–"}</span>`).join("") : "";
+      const indPairs = d.indicators ? Object.entries(d.indicators) :
+        (e.action==="scalp_enter" ? ["rsi_14","vwap_side","ema_state"].filter(k=>d[k]!=null).map(k=>[k,d[k]]) : []);
+      const inds = indPairs.length ? indPairs.map(([k,v]) =>
+        `<div class="ind"><b>${k.replace(/_/g," ")}</b>${typeof v==="number"?Number(v).toPrecision(5):v??"—"}</div>`).join("") : "";
+      const ai = d.ai ? `<div class="aibox">🤖 <b>${d.ai.sentiment}</b> · ${d.ai.confidence}% sure<br>${(d.ai.reasoning||"").replace(/</g,"&lt;")}${d.ai.risk_commentary?`<br><i style="color:var(--ink-muted)">Risk: ${(d.ai.risk_commentary||"").replace(/</g,"&lt;")}</i>`:""}</div>` : "";
+      const ai2 = d.ai_second ? `<div class="aibox">🎓 Second judge (${esc(d.ai_second.model||"?")}): <b>${esc(d.ai_second.sentiment||"?")}</b> · ${d.ai_second.confidence!=null?Number(d.ai_second.confidence):"?"}% sure</div>` : "";
+      const nums = (e.action==="enter"||e.action==="scalp_enter") ? `<div class="indgrid">
+          <div class="ind"><b>size</b>${qty(d.qty)} (${money(d.notional)})</div>
+          <div class="ind"><b>stop-loss</b>${money(d.stop_loss)}</div>
+          <div class="ind"><b>target</b>${money(d.take_profit)}</div></div>` :
+        ((e.action==="exit"||e.action==="scalp_exit") && d.pnl!=null ? `<div class="indgrid"><div class="ind"><b>result</b><span class="${cls(d.pnl)}">${money(d.pnl)}</span></div><div class="ind"><b>reason</b>${d.reason||""}</div></div>` : "");
+      detail = `<div class="detail">${votes?`<div class="votechips">${votes}</div>`:""}${nums}${inds?`<div class="indgrid">${inds}</div>`:""}${ai}${ai2}</div>`;
+    }
+    return `<div class="evt ${e.action}${expandable?" click":""}${open}" ${expandable?`data-k="${key}" onclick="toggleEvt(this)"`:""}>
+      <div class="row1"><span>${EMO[e.action]||"•"}</span><span class="sym">${e.symbol||""}</span>
+      <span style="color:var(--ink-muted);font-size:12px">${e.action.replace("_"," ")}</span><span class="when">${ago(e.ts)}</span></div>
+      ${why?`<div class="why">${String(why).replace(/</g,"&lt;")}</div>`:""}${detail}</div>`;
+  }).join("");
+}
+function toggleEvt(el){ const k = el.dataset.k; el.classList.toggle("open"); if (el.classList.contains("open")) state.feedOpen.add(k); else state.feedOpen.delete(k); }
+
+/* ---------- fast script (scalper) ---------- */
+const esc = s => String(s ?? "").replace(/</g,"&lt;");
+const escA = s => String(s ?? "").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");   // attribute-safe
+const pctFmt = v => (v==null||isNaN(v)) ? "?" : (100*v).toFixed(2).replace(/\.?0+$/,"") + "%";
+function tfMinutes(tf){ const m = /^(\d+)([mhd])$/.exec(String(tf||"")); if (!m) return 15;
+  const n = +m[1]; return m[2]==="m" ? n : m[2]==="h" ? n*60 : n*1440; }
+function fmtDur(mins){ if (!isFinite(mins)||mins<=0) return "?";
+  if (mins<60) return mins + " min"; if (mins<1440){ const h=mins/60; return (h%1?h.toFixed(1):h) + "h"; }
+  const dd=mins/1440; return (dd%1?dd.toFixed(1):dd) + "d"; }
+function fmtParamVal(k, v){
+  if (v==null) return "—";
+  if (Array.isArray(v)) return v.length ? v.join(", ") : "none";
+  if (typeof v==="number" && (k.endsWith("_pct") || k==="position_fraction")) return pctFmt(v);
+  return String(v);
+}
+function ruleSummary(p){
+  const sides = p.allowed_sides==="long" ? "buys" : p.allowed_sides==="short" ? "shorts" : "buys & shorts";
+  const hold = fmtDur((p.time_stop_bars||0) * tfMinutes(p.timeframe));
+  return `${sides} momentum on ${p.timeframe||"15m"} candles · +${pctFmt(p.tp_pct)} target · −${pctFmt(p.sl_pct)} stop · exit after ${hold} · ${pctFmt(p.position_fraction)} of the account per trade`;
+}
+function renderScalper(st){
+  const p = st.params || {}, s = st.stats || {};
+  const on = !!p.enabled || !!st.running_job;
+  $("scalpDot").className = "dot " + (on ? "on" : "off");
+  $("scalpState").textContent = on ? "every " + (p.interval_minutes ?? "?") + " min" : "off";
+  $("scalpOn").style.display = on ? "none" : "";
+  $("scalpOff").style.display = on ? "" : "none";
+  $("scalpRule").textContent = ruleSummary(p);
+  const wr = s.win_rate==null ? null : (s.win_rate<=1 ? 100*s.win_rate : s.win_rate);
+  $("scalpStats").innerHTML = `
+    <div class="ind"><b>trades today</b>${s.trades_today ?? 0}${p.max_trades_per_day ? " / " + p.max_trades_per_day : ""}</div>
+    <div class="ind"><b>win rate</b>${wr==null ? "—" : wr.toFixed(0) + "%"}${s.wins!=null ? ` <span style="color:var(--ink-muted)">(${s.wins}W/${s.losses ?? 0}L)</span>` : ""}</div>
+    <div class="ind"><b>profit</b><span class="${cls(s.pnl)}">${s.pnl==null ? "—" : (s.pnl>=0?"+":"−") + money(Math.abs(s.pnl))}</span></div>
+    <div class="ind"><b>open now</b>${s.open ?? 0}${p.max_positions ? " / " + p.max_positions : ""}</div>`;
+  const lt = st.last_tune;
+  if (!lt) {
+    $("scalpTuneWhen").textContent = "no tune yet";
+    $("scalpTuneInfo").innerHTML = '<span style="color:var(--ink-muted)">The AI reviews the script\'s results every hour while it is on and adjusts its settings within safe limits.</span>';
+    return;
+  }
+  const d = lt.detail || lt;
+  $("scalpTuneWhen").textContent = lt.ts ? "last tune " + ago(lt.ts) : "";
+  const before = d.before || {}, after = d.after || {};
+  let chips = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter(k => JSON.stringify(before[k]) !== JSON.stringify(after[k]))
+    .map(k => `<span class="vote">${esc(k)} ${esc(fmtParamVal(k, before[k]))} → ${esc(fmtParamVal(k, after[k]))}</span>`);
+  if (!chips.length && d.applied && typeof d.applied === "object")
+    chips = Object.entries(d.applied).map(([k,v]) => `<span class="vote">${esc(k)} → ${esc(fmtParamVal(k, v))}</span>`);
+  $("scalpTuneInfo").innerHTML =
+    (d.reasoning ? `<div>${esc(d.reasoning)}</div>` : "") +
+    (chips.length ? `<div class="votechips" style="margin-top:6px">${chips.join("")}</div>`
+                  : `<div style="color:var(--ink-muted);margin-top:4px">No changes — the AI kept the current settings.</div>`);
+}
+
+/* ---------- market intelligence (news agent + coach) ---------- */
+function parseHeadlines(raw){
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string"){ try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch(e){ return []; } }
+  return [];
+}
+const sentCls = s => s==="bullish" ? "pos" : s==="bearish" ? "neg" : "flat";
+function renderIntel(st, sent, pb){
+  state.intelData = { st, sent, pb };
+  const on = !!st.enabled;
+  $("intelDot").className = "dot " + (on ? "on" : "off");
+  $("intelState").textContent = on ? (st.last_refresh ? "updated " + ago(st.last_refresh) : "on — first read pending") : "off";
+  $("intelOn").style.display = on ? "none" : "";
+  $("intelOff").style.display = on ? "" : "none";
+  const fg = st.fear_greed;
+  if (fg && fg.value!=null && !isNaN(fg.value)){
+    const v = Number(fg.value);
+    const col = v<=25 ? "var(--down)" : v>=75 ? "var(--up)" : "var(--warn)";
+    $("fngVal").innerHTML = `<span style="color:${col};font-weight:700;font-size:17px">${v}</span> <span style="color:var(--ink-2)">· ${esc(fg.classification||"")}</span>`;
+  } else $("fngVal").innerHTML = '<span style="color:var(--ink-muted)">no data</span>';
+  const g = st.global || (sent||[]).find(r => r && r.symbol==="GLOBAL") || null;
+  $("intelMood").innerHTML = g && (g.summary || g.sentiment)
+    ? `${g.sentiment ? `<b class="${sentCls(g.sentiment)}">${esc(g.sentiment)}</b>` : ""}${g.score!=null ? ` <span style="color:var(--ink-muted)">(${g.score>0?"+":""}${Math.round(g.score)})</span>` : ""}${g.summary ? ` — ${esc(g.summary)}` : ""}`
+    : '<span style="color:var(--ink-muted)">no mood summary yet — press 🔄 Refresh now</span>';
+  renderSentChips((sent||[]).filter(r => r && r.symbol && r.symbol!=="GLOBAL"));
+  renderPlaybook(pb||[]);
+}
+function renderSentChips(coins){
+  const box = $("sentChips");
+  if (!coins.length){
+    box.innerHTML = '<span style="color:var(--ink-muted);font-size:13px">No coin scores yet — press <b>🔄 Refresh now</b> (reads the news, takes ~2 min).</span>';
+    $("sentDetail").style.display = "none"; $("sentDetail").innerHTML = ""; return;
+  }
+  coins = coins.slice().sort((a,b) => (b.score??0) - (a.score??0));
+  box.innerHTML = coins.map(r => {
+    const sc = Math.round(r.score ?? 0);
+    const c = sc>=25 ? " up" : sc<=-25 ? " dn" : "";
+    const sel = state.intelOpen===r.symbol ? " sel" : "";
+    return `<span class="chip${c}${sel}" onclick="toggleSent('${escA(r.symbol)}')">${esc(r.symbol.replace("USDT",""))} ${sc>0?"+":""}${sc}</span>`;
+  }).join("");
+  renderSentDetail(coins);
+}
+function renderSentDetail(coins){
+  const box = $("sentDetail");
+  const r = coins.find(x => x.symbol===state.intelOpen);
+  if (!r){ box.style.display = "none"; box.innerHTML = ""; return; }
+  const links = parseHeadlines(r.headlines).slice(0,8).map(h => {
+    const url = String((h && h.url) || "");
+    const title = esc((h && h.title) || url || "headline");
+    const src = h && h.source ? ` <span class="src">— ${esc(h.source)}</span>` : "";
+    return `<li>${/^https?:\/\//i.test(url) ? `<a href="${escA(url)}" target="_blank" rel="noopener noreferrer">${title}</a>` : title}${src}</li>`;
+  }).join("");
+  box.style.display = "";
+  box.innerHTML = `<div class="aibox" style="margin-top:10px">
+    <div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap">
+      <b>${esc(r.symbol.replace("USDT",""))}</b>
+      <span class="${sentCls(r.sentiment)}" style="font-weight:700">${esc(r.sentiment||"")}</span>
+      <span style="color:var(--ink-muted);font-size:12px">score ${(r.score??0)>0?"+":""}${r.score??"?"} · ${r.confidence??"?"}% sure${r.ts ? ` · ${ago(r.ts)}` : ""}</span>
+    </div>
+    ${r.summary ? `<div style="margin-top:5px">${esc(r.summary)}</div>` : ""}
+    ${links ? `<ul class="heads">${links}</ul>` : '<div style="color:var(--ink-muted);margin-top:4px;font-size:12px">No headlines saved for this coin.</div>'}
+  </div>`;
+}
+function toggleSent(sym){
+  state.intelOpen = state.intelOpen===sym ? null : sym;
+  const d = state.intelData;
+  if (d) renderSentChips((d.sent||[]).filter(r => r && r.symbol && r.symbol!=="GLOBAL"));
+}
+const BIAS_CHIP = { long_only: '<span class="vote up">⬆ long-only</span>', short_only: '<span class="vote dn">⬇ short-only</span>' };
+const nonDefaultPb = r => r && (r.bench || (r.side_bias && r.side_bias!=="both")
+  || (r.size_multiplier!=null && Math.abs(r.size_multiplier-1)>1e-9) || r.min_vote_override!=null);
+function renderPlaybook(pb){
+  const box = $("playbook");
+  const rows = pb.filter(nonDefaultPb);
+  if (!rows.length){
+    box.innerHTML = '<div style="color:var(--ink-muted);font-size:13px">No special instructions — the coach treats every coin normally. It reviews finished trades every 2 hours while intelligence is on.</div>';
+    return;
+  }
+  box.innerHTML = rows.map(r => {
+    const key = "pb|" + r.symbol;
+    const open = state.feedOpen.has(key) ? " open" : "";
+    const mult = Number(r.size_multiplier);
+    const chips = [
+      r.bench ? '<span class="vote dn">🚫 benched</span>' : "",
+      BIAS_CHIP[r.side_bias] || "",
+      r.size_multiplier!=null && Math.abs(mult-1)>1e-9 ? `<span class="vote">size ×${mult.toFixed(2).replace(/\.?0+$/,"")}</span>` : "",
+      r.min_vote_override!=null ? `<span class="vote">needs ${r.min_vote_override}/4 votes</span>` : ""
+    ].filter(Boolean).join("");
+    const canOpen = !!r.reasoning;
+    return `<div class="evt${canOpen?" click":""}${open}" ${canOpen?`data-k="${escA(key)}" onclick="toggleEvt(this)"`:""} style="border-color:var(--grid)">
+      <div class="row1"><span class="sym">${esc(r.symbol.replace("USDT",""))}</span>
+        <span class="votechips" style="margin:0">${chips}</span>
+        <span class="when">${r.updated_at ? ago(r.updated_at) : ""}</span></div>
+      ${canOpen ? `<div class="detail">🎓 ${esc(r.reasoning)}</div>` : ""}</div>`;
+  }).join("");
+}
+
+/* ---------- charts ---------- */
+async function loadCandles(){
+  try {
+    const d = await api(`/api/data/ohlcv?source=binance&symbol=${state.coin}&timeframe=${state.tf}&limit=220`);
+    const rows = d.data||[];
+    const x = rows.map(r=>r.timestamp);
+    const candle = { type:"candlestick", x, open:rows.map(r=>r.open), high:rows.map(r=>r.high), low:rows.map(r=>r.low), close:rows.map(r=>r.close),
+      increasing:{line:{color:"#0ca30c",width:1},fillcolor:"#0ca30c"}, decreasing:{line:{color:"#d03b3b",width:1},fillcolor:"#d03b3b"},
+      whiskerwidth:.35, hoverinfo:"x+y" };
+    const vol = { type:"bar", x, y:rows.map(r=>r.volume), yaxis:"y2", marker:{color:"rgba(137,135,129,.35)"}, hoverinfo:"skip" };
+    const traces = [candle, vol];
+    try {
+      const tr = (await api(`/api/paper/trades?limit=200`)).items||[];
+      const mine = tr.filter(t=>t.symbol===state.coin && new Date(t.executed_at) >= new Date(x[0]||0));
+      const lows = rows.map(r=>r.low), highs = rows.map(r=>r.high);
+      const pad = rows.length? (Math.max(...highs)-Math.min(...lows))*0.03 : 0;
+      const buys = mine.filter(t=>t.side==="buy"), sells = mine.filter(t=>t.side==="sell");
+      if (buys.length) traces.push({type:"scatter", mode:"markers+text", x:buys.map(t=>t.executed_at), y:buys.map(t=>t.price-pad),
+        marker:{symbol:"triangle-up", size:13, color:"#0ca30c", line:{color:"#1a1a19",width:2}}, text:buys.map(()=> "buy"), textposition:"bottom center", textfont:{size:10,color:"#0ca30c"}, hovertext:buys.map(t=>`BUY ${qty(t.qty)} @ ${money(t.price)}`), hoverinfo:"text"});
+      if (sells.length) traces.push({type:"scatter", mode:"markers+text", x:sells.map(t=>t.executed_at), y:sells.map(t=>t.price+pad),
+        marker:{symbol:"triangle-down", size:13, color:"#e66767", line:{color:"#1a1a19",width:2}}, text:sells.map(()=> "sell"), textposition:"top center", textfont:{size:10,color:"#e66767"}, hovertext:sells.map(t=>`SELL ${qty(t.qty)} @ ${money(t.price)}`), hoverinfo:"text"});
+    } catch(e){}
+    const layout = Object.assign({}, PL, {
+      xaxis: Object.assign({}, PL.xaxis, {rangeslider:{visible:false}, type:"date"}),
+      yaxis: Object.assign({}, PL.yaxis, {domain:[0.22,1], tickprefix:"$"}),
+      yaxis2:{domain:[0,0.16], gridcolor:"#2c2c2a", linecolor:"#383835", zeroline:false, fixedrange:true, showticklabels:false},
+      hovermode:"x unified" });
+    Plotly.react("candles", traces, layout, PCFG);
+  } catch(e){ $("candles").innerHTML = `<div class="empty">No chart data for ${state.coin} yet — it loads after the first data fetch.</div>`; }
+}
+
+async function loadEquity(){
+  try {
+    const d = await api("/api/paper/equity?limit=2000");
+    const items = d.items||[];
+    if (!items.length){ $("equity").innerHTML = '<div class="empty">The line starts once the bot makes its first scan.</div>'; return; }
+    const x = items.map(i=>i.ts), y = items.map(i=>i.equity);
+    $("eqMeta").textContent = "now " + money(y[y.length-1]);
+    Plotly.react("equity", [
+      {type:"scatter", mode:"lines", x, y, line:{color:"#3987e5", width:2}, fill:"tozeroy", fillcolor:"rgba(57,135,229,.09)", hovertemplate:"%{y:$.2f}<extra></extra>"},
+      {type:"scatter", mode:"lines", x:[x[0],x[x.length-1]], y:[100,100], line:{color:"#898781", width:1, dash:"dot"}, hoverinfo:"skip"}
+    ], Object.assign({}, PL, {hovermode:"x unified", yaxis:Object.assign({},PL.yaxis,{tickprefix:"$", range:[Math.min(99,...y)-0.5, Math.max(101,...y)+0.5]}), xaxis:Object.assign({},PL.xaxis,{type:"date"})}), PCFG);
+  } catch(e){}
+}
+
+/* ---------- chips ---------- */
+function renderChips(){
+  $("coinChips").innerHTML = state.coins.map(c=>`<span class="chip${c===state.coin?" sel":""}" onclick="pickCoin('${c}')">${c.replace("USDT","")}</span>`).join("");
+  $("tfChips").innerHTML = TFS.map(t=>`<span class="chip${t===state.tf?" sel":""}" onclick="pickTf('${t}')">${t}</span>`).join("");
+}
+function pickCoin(c){ state.coin=c; renderChips(); loadCandles(); }
+function pickTf(t){ state.tf=t; renderChips(); loadCandles(); }
+
+/* ---------- actions ---------- */
+$("btnStart").onclick = async () => { try { $("btnStart").disabled=true; await api("/api/bot/start",{method:"POST"}); await refreshLive(); } catch(e){ alert("Cannot start: "+e.message); } finally { $("btnStart").disabled=false; } };
+$("btnStop").onclick  = async () => { try { $("btnStop").disabled=true; await api("/api/bot/stop",{method:"POST"}); await refreshLive(); } catch(e){ alert("Cannot stop: "+e.message); } finally { $("btnStop").disabled=false; } };
+$("btnScan").onclick  = async () => {
+  const b = $("btnScan");
+  if (state.scanning) return;
+  state.scanning = true; b.innerHTML = '<span class="spin"></span> scanning… (can take a few minutes)'; b.disabled = true;
+  try { await api("/api/bot/run-once",{method:"POST"}); } catch(e){ alert("Scan failed: "+e.message); }
+  state.scanning = false; b.textContent = "⚡ Scan now"; b.disabled = false;
+  refreshLive(); loadEquity(); loadCandles();
+};
+$("scalpOn").onclick = async () => {
+  const b = $("scalpOn");
+  try { b.disabled=true; await api("/api/scalper/start",{method:"POST"}); await refreshLive(); }
+  catch(e){ alert("Cannot enable the fast script: "+e.message); } finally { b.disabled=false; }
+};
+$("scalpOff").onclick = async () => {
+  if (!confirm("Disable the fast script? Any open scalp trades will be closed at the current price.")) return;
+  const b = $("scalpOff");
+  try { b.disabled=true; await api("/api/scalper/stop",{method:"POST"}); await refreshLive(); }
+  catch(e){ alert("Cannot disable the fast script: "+e.message); } finally { b.disabled=false; }
+};
+$("btnTune").onclick = async () => {
+  const b = $("btnTune");
+  if (b.disabled) return;
+  b.disabled = true; b.innerHTML = '<span class="spin"></span> tuning… (~1 min)';
+  try { await api("/api/scalper/tune",{method:"POST"}); }
+  catch(e){ alert("Tune failed: "+e.message); }
+  b.disabled = false; b.textContent = "🛠️ Tune now";
+  refreshLive();
+};
+$("intelOn").onclick = async () => {
+  const b = $("intelOn");
+  try { b.disabled=true; await api("/api/intel/start",{method:"POST"}); await refreshLive(); }
+  catch(e){ alert("Cannot enable market intelligence: "+e.message); } finally { b.disabled=false; }
+};
+$("intelOff").onclick = async () => {
+  const b = $("intelOff");
+  try { b.disabled=true; await api("/api/intel/stop",{method:"POST"}); await refreshLive(); }
+  catch(e){ alert("Cannot disable market intelligence: "+e.message); } finally { b.disabled=false; }
+};
+$("btnIntelRefresh").onclick = async () => {
+  const b = $("btnIntelRefresh");
+  if (b.disabled) return;
+  b.disabled = true; b.innerHTML = '<span class="spin"></span> reading the news… (~2 min)';
+  try { await api("/api/intel/refresh",{method:"POST"}); }
+  catch(e){ alert("News refresh failed: "+e.message); }
+  b.disabled = false; b.textContent = "🔄 Refresh now";
+  refreshLive();
+};
+$("btnCoach").onclick = async () => {
+  const b = $("btnCoach");
+  if (b.disabled) return;
+  b.disabled = true; b.innerHTML = '<span class="spin"></span> reviewing trades… (can take minutes)';
+  try { await api("/api/coach/run",{method:"POST"}); }
+  catch(e){ alert("Coach run failed: "+e.message); }
+  b.disabled = false; b.textContent = "🎓 Run coach now";
+  refreshLive();
+};
+async function closePos(id){ if(!confirm("Close this trade at the current price?")) return;
+  try { await api(`/api/paper/positions/${id}/close`,{method:"POST"}); refreshLive(); loadEquity(); } catch(e){ alert(e.message); } }
+async function resetAccount(){ if(!confirm("Reset the account back to $100 and erase all paper trades?")) return;
+  try { await api("/api/paper/reset",{method:"POST"}); refreshLive(); loadEquity(); } catch(e){ alert(e.message); } }
+function showModal(){ $("modal").style.display="block"; $("modalBg").style.display="block"; }
+function hideModal(){ $("modal").style.display="none"; $("modalBg").style.display="none"; }
+$("btnHow").onclick = showModal;
+$("showScans").onchange = refreshLive;
+
+/* ---------- boot ---------- */
+renderChips();
+refreshLive(); loadCandles(); loadEquity();
+setInterval(refreshLive, 12000);
+setInterval(loadEquity, 60000);
+setInterval(loadCandles, 60000);
+</script>
+</body>
+</html>

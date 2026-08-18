@@ -1,0 +1,52 @@
+# =============================================================================
+# Trading AI Platform — docker-compose (PAPER TRADING ONLY)
+#
+#   docker compose up --build
+#
+# Services:
+#   backend    FastAPI on http://localhost:8000
+#   dashboard  Streamlit on http://localhost:8501
+#
+# There is deliberately NO ollama container: Ollama runs natively on the
+# Windows host so it can use the GPU (RTX 5060 Ti). Containers reach it via
+# http://host.docker.internal:11434 (extra_hosts maps it to the host gateway
+# on Linux engines; Docker Desktop provides it out of the box).
+#
+# The SQLite database is bind-mounted from ./data so it survives rebuilds and
+# is shared with a native (non-Docker) run of the platform.
+# =============================================================================
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    image: trading-ai-backend
+    container_name: trading-ai-backend
+    ports:
+      - "8000:8000"
+    environment:
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      OLLAMA_URL: "http://host.docker.internal:11434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    image: trading-ai-dashboard
+    container_name: trading-ai-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: "http://backend:8000"
+    depends_on:
+      - backend
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

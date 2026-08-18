@@ -1,0 +1,25 @@
+# Trading AI Platform — PAPER TRADING ONLY
+# Python >= 3.12 (developed on 3.14)
+
+# API
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+
+# Dashboard
+streamlit>=1.40
+plotly>=5.24
+
+# Data & maths
+pandas>=2.2
+numpy>=2.1
+requests>=2.32
+yfinance>=0.2.50
+apscheduler>=3.10
+
+# Utilities
+python-dotenv>=1.0
+
+# Tests
+pytest>=8.3

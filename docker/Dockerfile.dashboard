@@ -1,0 +1,33 @@
+# =============================================================================
+# Trading AI Platform — Streamlit dashboard image (PAPER TRADING ONLY)
+#
+# Build context is the PROJECT ROOT (see docker-compose.yml):
+#   docker build -f docker/Dockerfile.dashboard -t trading-ai-dashboard .
+#
+# The dashboard never imports backend modules — it talks to the backend API
+# over HTTP only. The API base URL is injected via the API_URL env variable
+# (docker-compose sets API_URL=http://backend:8000).
+# =============================================================================
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+WORKDIR /app
+
+# Install dependencies first for better layer caching.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application code (context = project root).
+COPY . .
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4)" || exit 1
+
+CMD ["streamlit", "run", "dashboard/app.py", "--server.address", "0.0.0.0", "--server.port", "8501", "--server.headless", "true"]

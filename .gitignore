@@ -5,7 +5,7 @@ __pycache__/
 .pytest_cache/
 
 # Local data & runtime state (SQLite DB, logs, PIDs)
-data/
+/data/
 *.log
 tmp_uvicorn_pid.txt
 pytest_out.txt

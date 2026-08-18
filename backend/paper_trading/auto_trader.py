@@ -470,6 +470,12 @@ class BotConfig(BaseModel):
             primary model, the candidate is conservatively skipped
             (``ai_fallback``) unless this flag is True. The second-judge
             path already forbids fallback substitution outright.
+        max_positions_per_symbol: How many bot positions may be open in the
+            SAME symbol at once (pyramiding). Clamped to [1, 10]; the default
+            1 preserves the classic one-position-per-coin behaviour. Each
+            entry is still sized/capped independently (max_position_fraction,
+            risk sizing, engine buying-power gate), and an opposite-side
+            "add" is FIFO-netted by the engine rather than hedged.
     """
 
     watchlist: list[str] = Field(default_factory=lambda: list(_DEFAULT_WATCHLIST))
@@ -499,6 +505,13 @@ class BotConfig(BaseModel):
     stop_streak_pause_hours: int = 6
     time_stop_bars: int = 0
     accept_fallback_verdicts: bool = False
+    max_positions_per_symbol: int = 1
+
+    @field_validator("max_positions_per_symbol")
+    @classmethod
+    def _clamp_max_positions_per_symbol(cls, value: int) -> int:
+        """Clamp concurrent same-symbol positions to [1, 10] (1 = classic)."""
+        return min(10, max(1, int(value)))
 
     @field_validator("cooldown_minutes_after_loss")
     @classmethod
@@ -1840,11 +1853,13 @@ class AutoTrader:
             candidate["rank_score"] = score
             return score
 
-        open_symbols = {str(p["symbol"]) for p in self.engine.get_positions("open")}
+        open_counts: dict[str, int] = {}
+        for p in self.engine.get_positions("open"):
+            open_counts[str(p["symbol"])] = open_counts.get(str(p["symbol"]), 0) + 1
         eligible = [
             c
             for c in candidates
-            if c["symbol"] not in open_symbols
+            if open_counts.get(c["symbol"], 0) < config.max_positions_per_symbol
             and abs(c["vote_sum"]) >= _required_vote(c)
             and _side_allowed(c)
         ]
@@ -2462,16 +2477,20 @@ class AutoTrader:
             )
             take_profit = None
 
-        # Re-check for an open position right before submitting: the
-        # shortlist's open-symbols snapshot is minutes old by now (AI
-        # confirmations can take up to ollama_timeout each) and the scalper
-        # ticks every couple of minutes — it may have entered this symbol
-        # meanwhile. A second position would concentrate far more than
-        # max_position_fraction in one coin, or open an opposite-side hedge
-        # on another timeframe that nets ~zero price PnL while paying
-        # commissions and slippage on both legs.
-        if any(
-            str(p["symbol"]) == symbol for p in self.engine.get_positions("open")
+        # Re-check the per-symbol position count right before submitting: the
+        # shortlist's snapshot is minutes old by now (AI confirmations can
+        # take up to ollama_timeout each) and the scalper ticks every couple
+        # of minutes — it may have entered this symbol meanwhile. Beyond
+        # max_positions_per_symbol, more same-coin exposure would concentrate
+        # past max_position_fraction, or open an opposite-side hedge that the
+        # engine would FIFO-net anyway while paying costs on both legs.
+        if (
+            sum(
+                1
+                for p in self.engine.get_positions("open")
+                if str(p["symbol"]) == symbol
+            )
+            >= config.max_positions_per_symbol
         ):
             counters["skipped"] += 1
             self._log(

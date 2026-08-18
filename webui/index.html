@@ -148,6 +148,33 @@
   footer { margin: 26px 22px; font-size: 12.5px; color: var(--ink-muted); text-align: center; }
   .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: sp 0.8s linear infinite; vertical-align: -2px; }
   @keyframes sp { to { transform: rotate(360deg); } }
+
+  /* AI brain panel */
+  #brain { display: flex; flex-direction: column; gap: 8px; max-height: 620px; overflow-y: auto; }
+  .bcoin { border: 1px solid var(--grid); border-radius: 9px; padding: 8px 10px; cursor: pointer; }
+  .bcoin:hover { background: var(--surface-2); }
+  .bcoin .row1 { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .bcoin .sym { font-weight: 700; color: var(--ink); }
+  .bcoin .meta { margin-left: auto; color: var(--ink-muted); font-size: 11.5px; white-space: nowrap; }
+  .brline { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; }
+  .brline.mut { color: var(--ink-muted); }
+  .clamp1 { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+  .clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .brhead { font-size: 11.5px; color: var(--ink-muted); margin-top: 2px; }
+  .fgbar { position: relative; display: inline-block; width: 64px; height: 6px; border-radius: 3px; background: linear-gradient(90deg, #d03b3b, #fab219, #0ca30c); vertical-align: 1px; }
+  .fgbar i { position: absolute; top: -3px; width: 4px; height: 12px; background: #fff; border-radius: 2px; transform: translateX(-50%); }
+
+  /* command box */
+  #cmdInput { flex: 1; min-width: 0; font: inherit; font-size: 14px; background: var(--surface-2); color: var(--ink); border: 1px solid var(--hairline); border-radius: 9px; padding: 8px 12px; }
+  #cmdInput::placeholder { color: var(--ink-muted); }
+  #cmdInput:focus { outline: none; border-color: var(--accent); }
+  #cmdOut { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 240px; overflow-y: auto; }
+  .cmdline { font-size: 13px; color: var(--ink-2); background: var(--surface-2); border: 1px solid transparent; border-radius: 7px; padding: 6px 9px; }
+  .cmdline.ok  { border-color: rgba(12,163,12,.35); background: rgba(12,163,12,.07); }
+  .cmdline.err { border-color: rgba(208,59,59,.35); background: rgba(208,59,59,.07); }
+  .cmdline.ask { border-color: rgba(250,178,25,.4); background: rgba(250,178,25,.08); }
+  .cmdline .u { color: var(--ink); font-weight: 600; }
+  .cmdline button { padding: 3px 12px; font-size: 12px; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -231,6 +258,22 @@
     </div>
 
     <div style="display:flex;flex-direction:column;gap:14px;min-width:0;align-self:start">
+      <div class="card">
+        <h2>🗣️ Tell the bot <span class="right">plain-text commands</span></h2>
+        <div style="display:flex;gap:8px">
+          <input id="cmdInput" placeholder="try &quot;buy BTC 25&quot;, &quot;close all&quot;, &quot;stop&quot;, &quot;analyze ETH&quot;…" autocomplete="off">
+          <button id="cmdSend" class="blue">Send</button>
+        </div>
+        <div class="chips" style="margin-top:8px">
+          <span class="chip" onclick="runCommand('close all')">close all</span>
+          <span class="chip" onclick="runCommand('stop')">⏸ stop all</span>
+          <span class="chip" onclick="runCommand('start')">▶ start all</span>
+          <span class="chip" onclick="cmdHelp()">❓ commands</span>
+        </div>
+        <div id="cmdOut"></div>
+        <div style="font-size:11.5px;color:var(--ink-muted);margin-top:8px">Anything that trades asks for a ✓ Confirm first. All orders are simulated paper trades.</div>
+      </div>
+
       <div class="card" id="scalpCard" style="display:none">
         <h2>⚡ Fast script
           <span class="pill" style="font-size:12px"><span id="scalpDot" class="dot"></span> <span id="scalpState">off</span></span>
@@ -250,6 +293,21 @@
           <div id="scalpTuneInfo" style="margin-top:6px"></div>
         </div>
         <div style="font-size:11.5px;color:var(--ink-muted);margin-top:8px">A simple rules-only scalper — no AI in the trade loop. The AI supervisor reviews its results every hour and re-tunes it within hard safety limits. Disabling closes its open trades.</div>
+      </div>
+
+      <div class="card">
+        <h2>🧠 AI Brain
+          <span class="right" style="display:flex;gap:8px;align-items:center">
+            <span id="brainWhen"></span>
+            <button id="btnBrainRefresh" class="ghost" style="padding:4px 12px;font-size:12.5px">🔄 Refresh</button>
+          </span>
+        </h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+          <div class="ind" style="flex:0 0 auto;padding:6px 10px"><b>Fear &amp; Greed</b><span id="brainFng" style="color:var(--ink-muted)">—</span></div>
+          <div class="ind" style="flex:1;min-width:200px;padding:6px 10px"><b>Market mood</b><span id="brainMood" style="color:var(--ink-muted)">—</span></div>
+        </div>
+        <div id="brain"><div class="empty">Loading the AI’s latest thinking…</div></div>
+        <div style="font-size:11.5px;color:var(--ink-muted);margin-top:8px">Latest AI verdict, news mood and futures positioning per coin — click a coin to expand. 🧪 Ask AI runs the local model fresh (15–40&nbsp;s) and also shows its opposing case.</div>
       </div>
 
       <div class="card">
@@ -314,7 +372,9 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const state = { coin: "BTCUSDT", tf: "1h", coins: ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT"],
-                botAvailable: true, scanning: false, feedOpen: new Set(), intelOpen: null, intelData: null };
+                botAvailable: true, scanning: false, feedOpen: new Set(), intelOpen: null, intelData: null,
+                brain: { verdicts: {}, sent: {}, deriv: {}, fng: null, global: null, updated: 0 },
+                brainOpen: new Set(), brainFresh: {}, asking: new Set() };
 const TFS = ["15m","1h","4h","1d"];
 
 const money = v => {
@@ -764,10 +824,271 @@ function hideModal(){ $("modal").style.display="none"; $("modalBg").style.displa
 $("btnHow").onclick = showModal;
 $("showScans").onchange = refreshLive;
 
+/* ---------- AI brain panel ---------- */
+async function refreshBrain(){
+  const [h, s, dv, ist] = await Promise.allSettled([
+    api("/api/analysis/history?limit=30"),
+    api("/api/intel/sentiment"),
+    api("/api/intel/derivatives"),
+    api("/api/intel/status")
+  ]);
+  const b = state.brain;
+  let any = false;
+  if (h.status==="fulfilled"){ any = true; b.verdicts = {};
+    for (const v of (h.value.items||[])){
+      if (!v || !v.symbol) continue;
+      const cur = b.verdicts[v.symbol];
+      if (!cur || new Date(v.created_at) > new Date(cur.created_at)) b.verdicts[v.symbol] = v;
+    }
+  }
+  if (s.status==="fulfilled"){ any = true; b.sent = {};
+    for (const r of (s.value.items||[])) if (r && r.symbol) b.sent[r.symbol] = r;
+  }
+  if (dv.status==="fulfilled"){ any = true; b.deriv = dv.value.items || {}; }
+  if (ist.status==="fulfilled"){ any = true; b.fng = ist.value.fear_greed || null; b.global = ist.value.global || b.sent.GLOBAL || null; }
+  else if (b.sent.GLOBAL) b.global = b.sent.GLOBAL;
+  if (any) b.updated = Date.now();
+  renderBrain();
+}
+
+const sentVote = s => "vote" + (s==="bullish" ? " up" : s==="bearish" ? " dn" : "");
+function renderBrain(){
+  const b = state.brain;
+  $("brainWhen").textContent = b.updated ? "updated " + ago(new Date(b.updated).toISOString()) : "";
+  const fg = b.fng;
+  if (fg && fg.value!=null && !isNaN(fg.value)){
+    const v = Math.max(0, Math.min(100, Number(fg.value)));
+    const col = v<=25 ? "var(--down)" : v>=75 ? "var(--up)" : "var(--warn)";
+    $("brainFng").innerHTML = `<span style="color:${col};font-weight:700">${v}</span> <span class="fgbar"><i style="left:${v}%"></i></span> <span style="color:var(--ink-2);font-size:12px">${esc(fg.classification||"")}</span>`;
+  } else $("brainFng").innerHTML = '<span style="color:var(--ink-muted)">no data</span>';
+  const g = b.global;
+  $("brainMood").innerHTML = g && (g.summary || g.sentiment)
+    ? `${g.sentiment ? `<b class="${sentCls(g.sentiment)}">${esc(g.sentiment)}</b>` : ""}${g.score!=null ? ` <span style="color:var(--ink-muted)">(${g.score>0?"+":""}${Math.round(g.score)})</span>` : ""}${g.summary ? ` — ${esc(g.summary)}` : ""}`
+    : '<span style="color:var(--ink-muted)">no market mood yet — press 🔄 Refresh now in Market intelligence</span>';
+  const box = $("brain");
+  if (!b.updated){ box.innerHTML = '<div class="empty">Cannot load the AI brain — is the trading engine (port 8000) running?</div>'; return; }
+  box.innerHTML = state.coins.map(brainCoinHtml).join("");
+}
+
+function brainCoinHtml(sym){
+  const b = state.brain;
+  let v = b.verdicts[sym] || null;
+  let fresh = state.brainFresh[sym] || null;
+  if (fresh && (!v || new Date(fresh.created_at) >= new Date(v.created_at))) v = fresh;
+  else fresh = null;                                  // history overtook the on-demand verdict
+  const n = b.sent[sym] || null;
+  const d = (b.deriv || {})[sym] || null;
+  const open = state.brainOpen.has(sym);
+  const asking = state.asking.has(sym);
+  const name = sym.replace("USDT","");
+  const head = v
+    ? `<span class="${sentVote(v.sentiment)}">${esc(v.sentiment||"?")}</span><span style="color:var(--ink-2);font-size:12px">${v.confidence!=null ? Number(v.confidence)+"% sure" : ""}</span>`
+    : `<span style="color:var(--ink-muted);font-size:12px">no analysis yet</span>`;
+  const meta = v ? `${fresh ? "✨ fresh · " : ""}${esc(v.model || v.model_used || "")}${v.created_at ? " · " + ago(v.created_at) : ""}` : "";
+  const askBtn = `<button class="ghost" style="padding:2px 10px;font-size:11.5px" ${asking?"disabled":""} onclick="event.stopPropagation();askAI('${sym}')">${asking ? '<span class="spin"></span> asking… (15–40s)' : "🧪 Ask AI"}</button>`;
+  let ai;
+  if (v){
+    ai = `<div class="brline${open?"":" clamp2"}">🤖 ${esc(v.reasoning || "(no written reasoning)")}</div>`;
+    if (open && v.risk_commentary) ai += `<div class="brline" style="font-style:italic;color:var(--ink-muted)">⚠️ Risk: ${esc(v.risk_commentary)}</div>`;
+    if (open && fresh && fresh.opposing_case) ai += `<div class="aibox" style="border-left-color:var(--warn)">🤔 <b>Opposing case:</b> ${esc(fresh.opposing_case)}</div>`;
+  } else ai = `<div class="brline mut">The trading AI has not judged ${name} yet — press 🧪 Ask AI.</div>`;
+  let news;
+  if (n && (n.summary || n.score!=null)){
+    const sc = Math.round(n.score ?? 0);
+    news = `<div class="brline${open?"":" clamp1"}">📰 <b class="${sc>=25?"pos":sc<=-25?"neg":"flat"}">${sc>0?"+":""}${sc}</b> ${esc(n.summary||"")}</div>`
+      + parseHeadlines(n.headlines).slice(0,2).map(hd =>
+          `<div class="brhead clamp1">· ${esc((hd && hd.title) || "")}${hd && hd.source ? ` — ${esc(hd.source)}` : ""}</div>`).join("");
+  } else news = `<div class="brline mut">📰 no news mood yet — press 🔄 Refresh now in Market intelligence</div>`;
+  const posi = d && d.note
+    ? `<div class="brline${open?"":" clamp1"}">📊 <b>Positioning (Binance futures):</b> ${esc(d.note)}</div>`
+    : `<div class="brline mut">📊 no futures positioning data yet — press 🔄 Refresh now in Market intelligence</div>`;
+  return `<div class="bcoin" onclick="toggleBrain('${sym}')">
+    <div class="row1"><span class="sym">${name}</span>${head}<span class="meta">${meta}</span>${askBtn}</div>
+    ${ai}${news}${posi}</div>`;
+}
+function toggleBrain(sym){ if (state.brainOpen.has(sym)) state.brainOpen.delete(sym); else state.brainOpen.add(sym); renderBrain(); }
+
+async function askAI(sym){
+  if (state.asking.has(sym)) return;
+  state.asking.add(sym); renderBrain();
+  try {
+    const v = await api("/api/analysis", {method:"POST", body: JSON.stringify({source:"binance", symbol:sym, timeframe:"1h"})});
+    v.created_at = v.created_at || new Date().toISOString();
+    v.model = v.model || v.model_used;
+    state.brainFresh[sym] = v;
+    state.brainOpen.add(sym);
+    cmdLine(`✨ Fresh AI verdict on ${sym.replace("USDT","")}: <span class="u">${esc(v.sentiment||"?")}</span> at ${v.confidence!=null?Number(v.confidence):"?"}% — details in the AI Brain panel.`, "ok");
+  } catch(e){
+    cmdLine(`🚫 AI analysis of ${sym.replace("USDT","")} failed: ${esc(e.message)}`, "err");
+  } finally { state.asking.delete(sym); renderBrain(); }
+}
+$("btnBrainRefresh").onclick = async () => {
+  const btn = $("btnBrainRefresh");
+  if (btn.disabled) return;
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> refreshing…';
+  try { await refreshBrain(); } finally { btn.disabled = false; btn.textContent = "🔄 Refresh"; }
+};
+
+/* ---------- command box ("Tell the bot") ---------- */
+const COIN_ALIAS = {BTC:"BTCUSDT",ETH:"ETHUSDT",SOL:"SOLUSDT",BNB:"BNBUSDT",XRP:"XRPUSDT",DOGE:"DOGEUSDT",ADA:"ADAUSDT",AVAX:"AVAXUSDT",LINK:"LINKUSDT",DOT:"DOTUSDT"};
+function resolveCoin(w){
+  if (!w) return null;
+  const u = String(w).toUpperCase().replace(/[^A-Z0-9]/g,"");
+  if (COIN_ALIAS[u]) return COIN_ALIAS[u];
+  if (/^[A-Z0-9]{2,10}USDT$/.test(u)) return u;
+  if (state.coins.includes(u + "USDT")) return u + "USDT";
+  return null;
+}
+function cmdLine(html, kind){
+  const out = $("cmdOut");
+  const div = document.createElement("div");
+  div.className = "cmdline" + (kind ? " " + kind : "");
+  div.innerHTML = html;
+  out.appendChild(div);
+  while (out.children.length > 40) out.removeChild(out.firstChild);
+  out.scrollTop = out.scrollHeight;
+  return div;
+}
+const CMD_HELP = 'Commands: <span class="u">buy BTC 25</span> (paper-buy ~$25 — default $10) · <span class="u">short ETH 10</span> · <span class="u">sell SOL</span> / <span class="u">close SOL</span> (close all SOL trades) · <span class="u">close all</span> · <span class="u">stop</span> / <span class="u">start</span> (bot + fast script) · <span class="u">stop bot</span> · <span class="u">start scalper</span> · <span class="u">analyze BTC</span>.<br>Coins: BTC ETH SOL BNB XRP DOGE ADA AVAX LINK DOT.';
+function cmdHelp(){ cmdLine(CMD_HELP); }
+
+let pendingCmd = null;
+function requestConfirm(label, run){
+  cancelPending("replaced by a newer command");
+  const el = cmdLine(`${label} — <button class="primary" onclick="confirmCmd(true)">✓ Confirm</button><button class="ghost" onclick="confirmCmd(false)">✕ Cancel</button>`, "ask");
+  pendingCmd = {el, run, label};
+}
+function cancelPending(reason){
+  if (!pendingCmd) return;
+  pendingCmd.el.className = "cmdline";
+  pendingCmd.el.innerHTML = `${pendingCmd.label} — <span style="color:var(--ink-muted)">cancelled${reason ? " (" + reason + ")" : ""}</span>`;
+  pendingCmd = null;
+}
+async function confirmCmd(yes){
+  const p = pendingCmd;
+  if (!p) return;
+  if (!yes){ cancelPending(""); return; }
+  pendingCmd = null;
+  p.el.innerHTML = `${p.label} — <span class="spin"></span> working…`;
+  try { await p.run(); p.el.className = "cmdline"; p.el.innerHTML = `${p.label} — <span style="color:var(--ink-muted)">done, result below ↓</span>`; }
+  catch(e){ p.el.className = "cmdline"; p.el.innerHTML = p.label; cmdLine(`🚫 ${esc(e.message)}`, "err"); }
+}
+
+async function lastPriceOf(sym){
+  // Same source the price chart uses: latest cached close from /api/data/ohlcv.
+  const d = await api(`/api/data/ohlcv?source=binance&symbol=${sym}&timeframe=1h&limit=2`);
+  const rows = d.data || [];
+  if (!rows.length || rows[rows.length-1].close==null) throw new Error("no cached price data for " + sym);
+  return Number(rows[rows.length-1].close);
+}
+
+async function cmdTrade(sym, side, usd){
+  let px;
+  try { px = await lastPriceOf(sym); }
+  catch(e){ cmdLine(`🚫 Cannot get a price for ${sym}: ${esc(e.message)}`, "err"); return; }
+  if (side==="sell"){
+    try {
+      const open = (await api("/api/paper/positions?status=open")).items || [];
+      if (open.some(p => p.symbol===sym && p.side==="long")){
+        cmdLine(`You already have an open <span class="u">long</span> on ${sym.replace("USDT","")} — a market sell would just close it. Use <span class="u">sell ${sym.replace("USDT","")}</span> to close it first, then short.`, "err");
+        return;
+      }
+    } catch(e){}
+  }
+  const q = usd / px;
+  const nm = sym.replace("USDT","");
+  requestConfirm(`${side==="buy" ? "Buy" : "Short"} $${usd} of ${sym} at ~${money(px)} (≈${qty(q)} ${nm})`, async () => {
+    try {
+      const o = await api("/api/paper/orders", {method:"POST", body: JSON.stringify({symbol:sym, side, order_type:"market", qty:q, source:"binance", timeframe:"1h"})});
+      const fill = o && o.fill_price!=null ? " at " + money(o.fill_price) : "";
+      cmdLine(`✅ ${side==="buy" ? "Bought" : "Shorted"} ${qty(o && o.qty!=null ? o.qty : q)} ${nm}${fill} — order ${esc((o && o.status) || "submitted")}.`, "ok");
+    } catch(e){
+      cmdLine(`🚫 Order rejected: ${esc(e.message)}`, "err");
+    }
+    refreshLive(); loadEquity(); loadCandles();
+  });
+}
+
+async function cmdClose(sym){                       // sym = null → close everything
+  let items = [];
+  try { items = (await api("/api/paper/positions?status=open")).items || []; }
+  catch(e){ cmdLine(`🚫 Cannot read open positions: ${esc(e.message)}`, "err"); return; }
+  const targets = sym ? items.filter(p => p.symbol===sym) : items;
+  if (!targets.length){ cmdLine(`Nothing to close — no open trades${sym ? " on " + sym.replace("USDT","") : ""}.`); return; }
+  const desc = targets.map(p => `${p.side} ${p.symbol.replace("USDT","")}`).join(", ");
+  requestConfirm(`Close ${targets.length} open trade${targets.length>1?"s":""} at market (${esc(desc)})`, async () => {
+    let ok = 0;
+    for (const p of targets){
+      try { await api(`/api/paper/positions/${p.id}/close`, {method:"POST"}); ok++; }
+      catch(e){ cmdLine(`🚫 Could not close ${p.symbol.replace("USDT","")} #${p.id}: ${esc(e.message)}`, "err"); }
+    }
+    if (ok) cmdLine(`✅ Closed ${ok}/${targets.length} trade${targets.length>1?"s":""}.`, "ok");
+    refreshLive(); loadEquity(); loadCandles();
+  });
+}
+
+async function cmdCtl(action, which){              // which: "bot" | "scalper" | "both"
+  const wrap = p => p.then(() => null, e => e);     // never leaves an unhandled rejection
+  const jobs = [];
+  if (which!=="scalper") jobs.push(["AI bot", wrap(api(`/api/bot/${action}`, {method:"POST"}))]);
+  if (which!=="bot") jobs.push(["fast script", wrap(api(`/api/scalper/${action}`, {method:"POST"}))]);
+  for (const [name, pr] of jobs){
+    const err = await pr;
+    if (!err) cmdLine(`✅ ${name} ${action==="start" ? "started" : "stopped"}.`, "ok");
+    else cmdLine(`🚫 Cannot ${action} the ${name}: ${esc(err.message)}`, "err");
+  }
+  refreshLive();
+}
+
+async function runCommand(text){
+  text = String(text || "").trim();
+  if (!text) return;
+  cmdLine(`&gt; ${esc(text)}`);
+  const parts = text.toLowerCase().split(/\s+/);
+  const verb = parts[0];
+  if (["help","?","commands","h"].includes(verb)) return cmdHelp();
+  if (verb==="buy" || verb==="long" || verb==="short"){
+    const sym = resolveCoin(parts[1]);
+    if (!sym) return cmdLine(`I don't know that coin. ${CMD_HELP}`, "err");
+    let usd = 10;
+    if (parts[2]!=null){
+      usd = parseFloat(String(parts[2]).replace(/[^0-9.]/g,""));
+      if (!isFinite(usd) || usd<=0) return cmdLine(`Bad amount “${esc(parts[2])}” — try e.g. <span class="u">${verb} ${sym.replace("USDT","")} 25</span>.`, "err");
+    }
+    return cmdTrade(sym, verb==="short" ? "sell" : "buy", usd);
+  }
+  if ((verb==="close" || verb==="sell") && (parts[1]==="all" || parts[1]==="everything")) return cmdClose(null);
+  if (verb==="closeall") return cmdClose(null);
+  if (verb==="close" || verb==="sell" || verb==="exit" || verb==="flat"){
+    const sym = resolveCoin(parts[1]);
+    if (!sym) return cmdLine(`Which coin? e.g. <span class="u">${verb} BTC</span>, or <span class="u">close all</span>.`, "err");
+    return cmdClose(sym);
+  }
+  if (verb==="stop" || verb==="start" || verb==="pause" || verb==="resume"){
+    const action = (verb==="stop" || verb==="pause") ? "stop" : "start";
+    const w = parts[1];
+    const which = (!w || w==="all" || w==="everything" || w==="both") ? "both"
+      : (w==="bot" || w==="ai") ? "bot"
+      : (w==="scalper" || w==="scalp" || w==="script") ? "scalper" : null;
+    if (!which) return cmdLine(`Stop/start what? <span class="u">${action}</span>, <span class="u">${action} bot</span> or <span class="u">${action} scalper</span>.`, "err");
+    return cmdCtl(action, which);
+  }
+  if (["analyze","analyse","ask","analysis"].includes(verb)){
+    const sym = resolveCoin(parts[1]);
+    if (!sym) return cmdLine(`Which coin? e.g. <span class="u">analyze BTC</span>.`, "err");
+    cmdLine(`🧪 Asking the AI about ${sym.replace("USDT","")} — the fresh verdict lands in the <span class="u">AI Brain</span> panel (15–40&nbsp;s).`);
+    return askAI(sym);
+  }
+  cmdLine(`I didn't understand “${esc(text)}”. ${CMD_HELP}`, "err");
+}
+$("cmdSend").onclick = () => { const v = $("cmdInput").value; $("cmdInput").value = ""; runCommand(v); };
+$("cmdInput").addEventListener("keydown", e => { if (e.key==="Enter"){ e.preventDefault(); $("cmdSend").onclick(); } });
+
 /* ---------- boot ---------- */
 renderChips();
-refreshLive(); loadCandles(); loadEquity();
+refreshLive(); loadCandles(); loadEquity(); refreshBrain(); cmdHelp();
 setInterval(refreshLive, 12000);
+setInterval(refreshBrain, 12000);
 setInterval(loadEquity, 60000);
 setInterval(loadCandles, 60000);
 </script>

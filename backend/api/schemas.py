@@ -215,6 +215,14 @@ class BotConfigUpdate(BaseModel):
             "instead of gating the entry."
         ),
     )
+    max_positions_per_symbol: int | None = Field(
+        None,
+        description=(
+            "Concurrent bot positions allowed in the SAME symbol "
+            "(pyramiding). Not range-checked here — BotConfig clamps to "
+            "[1, 10]; 1 = classic one-position-per-coin."
+        ),
+    )
 
 
 class ScalperParamsUpdate(BaseModel):

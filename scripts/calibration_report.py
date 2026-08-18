@@ -12,7 +12,8 @@ Reads (read-only) from the bot_activity audit log and paper_positions:
     verdicts, so the gate's veto behaviour is measurable too.
   * ``ai_analyses`` gives per-model call volume — including silent
     fallback-model substitution (the ``model`` column records who really
-    answered).
+    answered) — and, when the telemetry columns exist (newer DBs), fallback
+    share, self-repair rate and average call latency per model.
 
 Usage:
     python scripts/calibration_report.py [--db PATH] [--json PATH]
@@ -138,16 +139,28 @@ def skip_funnel(activity: list[dict]) -> dict[str, int]:
 
 
 def model_health(conn: sqlite3.Connection) -> list[dict]:
+    # Telemetry columns arrived later — older DBs simply don't have them, so
+    # probe first and only add the extra aggregates when they exist.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(ai_analyses)").fetchall()}
+    has_telemetry = {"fallback_used", "repair_used", "latency_ms"} <= cols
+    telemetry_select = (
+        """, SUM(CASE WHEN fallback_used=1 THEN 1 ELSE 0 END) AS fallbacks,
+             SUM(CASE WHEN repair_used=1 THEN 1 ELSE 0 END) AS repairs,
+             AVG(latency_ms) AS avg_latency"""
+        if has_telemetry
+        else ""
+    )
     rows = conn.execute(
-        """SELECT model, COUNT(*) AS n, AVG(confidence) AS avg_conf,
+        f"""SELECT model, COUNT(*) AS n, AVG(confidence) AS avg_conf,
                   SUM(CASE WHEN sentiment='neutral' THEN 1 ELSE 0 END) AS neutral,
                   SUM(CASE WHEN sentiment='bullish' THEN 1 ELSE 0 END) AS bullish,
                   SUM(CASE WHEN sentiment='bearish' THEN 1 ELSE 0 END) AS bearish,
-                  MIN(created_at) AS first_ts, MAX(created_at) AS last_ts
+                  MIN(created_at) AS first_ts, MAX(created_at) AS last_ts{telemetry_select}
            FROM ai_analyses GROUP BY model ORDER BY n DESC"""
     ).fetchall()
-    return [
-        {
+    out = []
+    for r in rows:
+        item = {
             "model": r["model"],
             "calls": r["n"],
             "avg_confidence": round(r["avg_conf"], 1) if r["avg_conf"] is not None else None,
@@ -157,8 +170,12 @@ def model_health(conn: sqlite3.Connection) -> list[dict]:
             "first": _iso(r["first_ts"]),
             "last": _iso(r["last_ts"]),
         }
-        for r in rows
-    ]
+        if has_telemetry:
+            item["fallback_share"] = round(100 * (r["fallbacks"] or 0) / r["n"], 1) if r["n"] else None
+            item["repair_rate"] = round(100 * (r["repairs"] or 0) / r["n"], 1) if r["n"] else None
+            item["avg_latency_ms"] = round(r["avg_latency"]) if r["avg_latency"] is not None else None
+        out.append(item)
+    return out
 
 
 def scalper_summary(activity: list[dict]) -> dict:
@@ -262,9 +279,13 @@ def print_report(rep: dict) -> None:
     print("\n## Model health (ai_analyses — who actually answered)")
     if rep["model_health"]:
         for m in rep["model_health"]:
+            extra = ""
+            if "fallback_share" in m:  # telemetry columns present (newer DBs)
+                extra = (f" fallback%={m['fallback_share']} repair%={m['repair_rate']} "
+                         f"avg_latency_ms={m['avg_latency_ms']}")
             print(f"  {m['model']:<28} calls={m['calls']:<4} avg_conf={m['avg_confidence']} "
                   f"bull/bear/neutral={m['bullish']}/{m['bearish']}/{m['neutral']} "
-                  f"[{m['first']} .. {m['last']}]")
+                  f"[{m['first']} .. {m['last']}]{extra}")
     else:
         print("  (no ai_analyses rows yet)")
 

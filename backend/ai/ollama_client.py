@@ -125,6 +125,15 @@ class OllamaClient:
         #: Name of the model that produced the last successful ``chat`` reply
         #: (the resolved installed tag, or the fallback when it answered).
         self.last_model_used: str | None = None
+        #: Telemetry for the last successful ``chat`` reply: ``latency_ms``
+        #: (wall clock for the whole call, backoff included), ``attempts``
+        #: (calls actually made across primary and fallback),
+        #: ``fallback_used`` (True when the fallback model answered) and,
+        #: when the Ollama response reported them, ``eval_count`` /
+        #: ``prompt_eval_count`` / ``eval_duration`` / ``total_duration``.
+        self.last_call_stats: dict[str, object] | None = None
+        # Raw counters from the most recent successful /api/chat response.
+        self._last_response_meta: dict[str, int] = {}
 
     def list_models(self) -> list[str]:
         """Return the names of locally installed models.
@@ -238,12 +247,15 @@ class OllamaClient:
 
         Returns:
             The cleaned response text. ``self.last_model_used`` records the
-            model that actually produced it.
+            model that actually produced it and ``self.last_call_stats``
+            records the call telemetry (latency, attempts, fallback use and
+            any token/duration counters the server reported).
 
         Raises:
             OllamaError: When every planned model (requested and, if
                 allowed, the fallback) fails or is not installed.
         """
+        started = time.monotonic()
         primary = model or settings.ollama_model
         fallback = settings.ollama_fallback_model if allow_fallback else ""
 
@@ -279,6 +291,7 @@ class OllamaClient:
             )
 
         last_error: Exception | None = None
+        attempts_made = 0
         for model_name, attempts in plan:
             for attempt in range(attempts):
                 if attempt > 0:
@@ -288,6 +301,7 @@ class OllamaClient:
                         model_name, delay, attempt + 1, attempts,
                     )
                     time.sleep(delay)
+                attempts_made += 1
                 try:
                     reply = self._chat_once(model_name, prompt, system, json_mode, temperature)
                 except OllamaError as exc:
@@ -298,6 +312,15 @@ class OllamaClient:
                     )
                 else:
                     self.last_model_used = model_name
+                    stats: dict[str, object] = {
+                        "latency_ms": int((time.monotonic() - started) * 1000),
+                        "attempts": attempts_made,
+                        "fallback_used": bool(fallback)
+                        and model_name == fallback
+                        and model_name != resolved,
+                    }
+                    stats.update(self._last_response_meta)
+                    self.last_call_stats = stats
                     return reply
             if len(plan) > 1 and model_name == plan[0][0]:
                 logger.warning(
@@ -372,4 +395,13 @@ class OllamaClient:
             text = _extract_json_object(text)
         if not text:
             raise OllamaError(f"Empty response from model '{model}' after cleanup")
+
+        # Telemetry: raw counters Ollama reports alongside a reply (absent on
+        # some builds/models — recorded only when present and numeric).
+        meta: dict[str, int] = {}
+        for key in ("eval_count", "prompt_eval_count", "eval_duration", "total_duration"):
+            value = data.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                meta[key] = int(value)
+        self._last_response_meta = meta
         return text

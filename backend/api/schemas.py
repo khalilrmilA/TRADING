@@ -178,6 +178,43 @@ class BotConfigUpdate(BaseModel):
             "trade). Not range-checked here — BotConfig clamps to [0, 2]."
         ),
     )
+    cooldown_minutes_after_loss: int | None = Field(
+        None,
+        description=(
+            "Protection: skip a symbol for this many minutes after a losing "
+            "bot position closes on it. 0 disables. Not range-checked here — "
+            "BotConfig clamps to [0, 1440]."
+        ),
+    )
+    stop_streak_limit: int | None = Field(
+        None,
+        description=(
+            "Protection: this many stop-loss exits within "
+            "stop_streak_window_hours pauses NEW entries for "
+            "stop_streak_pause_hours. 0 disables. BotConfig clamps to [0, 20]."
+        ),
+    )
+    stop_streak_window_hours: int | None = Field(
+        None, description="Lookback window for the stop-streak count. BotConfig clamps to [1, 168]."
+    )
+    stop_streak_pause_hours: int | None = Field(
+        None, description="Stand-aside duration after a stop streak. BotConfig clamps to [1, 72]."
+    )
+    time_stop_bars: int | None = Field(
+        None,
+        description=(
+            "Close bot positions older than this many bars of their own "
+            "timeframe. 0 disables. BotConfig clamps to [0, 500]."
+        ),
+    )
+    accept_fallback_verdicts: bool | None = Field(
+        None,
+        description=(
+            "When False (default), a primary-gate verdict answered by the "
+            "FALLBACK model is a conservative skip (reason 'ai_fallback') "
+            "instead of gating the entry."
+        ),
+    )
 
 
 class ScalperParamsUpdate(BaseModel):

@@ -28,7 +28,13 @@ CREATE TABLE IF NOT EXISTS ai_analyses (
     risk_commentary TEXT    NOT NULL DEFAULT '',
     key_indicators  TEXT    NOT NULL DEFAULT '[]',   -- JSON array
     reasoning       TEXT    NOT NULL DEFAULT '',
-    raw_response    TEXT    NOT NULL DEFAULT ''
+    raw_response    TEXT    NOT NULL DEFAULT '',
+    -- Call telemetry (older DBs are migrated at runtime by the analyst):
+    prompt_hash     TEXT    NOT NULL DEFAULT '',     -- sha256[:12] of system + "\n" + user prompt
+    latency_ms      INTEGER,                         -- wall-clock chat latency (retries included)
+    attempts        INTEGER,                         -- chat attempts actually made
+    fallback_used   INTEGER NOT NULL DEFAULT 0,      -- 1 = fallback model answered
+    repair_used     INTEGER NOT NULL DEFAULT 0       -- 1 = self-repair round-trip fired
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_analyses_symbol ON ai_analyses (symbol, created_at DESC);

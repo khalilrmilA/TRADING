@@ -21,5 +21,8 @@ apscheduler>=3.10
 # Utilities
 python-dotenv>=1.0
 
+# Research
+optuna>=3.6
+
 # Tests
 pytest>=8.3

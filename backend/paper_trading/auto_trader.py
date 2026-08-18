@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 _CONFIG_KEY = "bot_config"
 _LAST_CYCLE_TS_KEY = "bot_last_cycle_ts"
 _LAST_CYCLE_SUMMARY_KEY = "bot_last_cycle_summary"
+#: Epoch ms until which the stop-streak protection pauses NEW entries.
+#: Persisted so the stand-aside survives restarts and the ``halt`` row is
+#: written once per pause, not once per cycle.
+_STOP_STREAK_PAUSE_KEY = "bot_stop_streak_pause_until"
 #: account_state key written by the API's Ollama watchdog (cross-module
 #: contract). A MISSING or malformed key means ONLINE — a watchdog that never
 #: ran must not block trading.
@@ -282,6 +286,31 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _opened_at_ts(position: dict[str, Any]) -> pd.Timestamp | None:
+    """UTC open timestamp of a position dict, or None when unparseable.
+
+    Engine snapshots serialize ``opened_at`` as an ISO-8601 string while raw
+    DB rows carry epoch milliseconds — accept both (same tolerance as the
+    trailing-stop window lookup) so the time-stop never miscomputes an age.
+
+    Args:
+        position: Position dict (engine shape) with an ``opened_at`` field.
+
+    Returns:
+        Timezone-aware UTC timestamp, or ``None`` when missing/malformed.
+    """
+    raw = position.get("opened_at")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            return pd.Timestamp(int(raw), unit="ms", tz="UTC")
+        ts = pd.Timestamp(str(raw))
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    except (TypeError, ValueError):
+        return None
+
+
 def _r_multiples(position: dict[str, Any]) -> tuple[float | None, float | None]:
     """R-multiple diagnostics for a closed position (contract v3).
 
@@ -409,7 +438,38 @@ class BotConfig(BaseModel):
             are all bypassed; the shortlist is no longer capped by
             ``max_ai_calls_per_cycle``. Exits (SL/TP, trailing, ensemble
             flips), engine-level order checks and the hard daily halt still
-            apply. USER-ONLY. PAPER TRADING ONLY.
+            apply. The trade protections below (loss cooldown, stop-streak
+            stand-aside, time-stop) are RISK RULES, not AI gates — they stay
+            active in research mode. USER-ONLY. PAPER TRADING ONLY.
+        cooldown_minutes_after_loss: Per-pair loss cooldown (Freqtrade-style
+            protection): after a bot position in a symbol closes at a loss,
+            new entries in that symbol are skipped (``protection_cooldown``)
+            until this many minutes have passed. Clamped to [0, 1440]; 0
+            disables. Scalper-owned positions are excluded — the scalper has
+            its own anti-churn cooldown.
+        stop_streak_limit: Stop-streak stand-aside (Freqtrade-style
+            protection): when this many bot ``stop_loss`` exits happen inside
+            ``stop_streak_window_hours``, ALL new entries pause for
+            ``stop_streak_pause_hours`` (one ``halt`` row, reason
+            ``protection_stop_streak``; open positions keep being managed).
+            Clamped to [0, 20]; 0 disables.
+        stop_streak_window_hours: Look-back window (hours) for counting
+            stop-loss exits. Clamped to [1, 168].
+        stop_streak_pause_hours: How long (hours) the stand-aside pauses new
+            entries once triggered; persisted so it survives restarts.
+            Clamped to [1, 72].
+        time_stop_bars: Maximum holding age of a bot position, in bars of its
+            own timeframe: positions older than ``time_stop_bars`` bars are
+            market-closed during position management (``exit`` reason
+            ``time_stop``). Clamped to [0, 500]; 0 (default) disables.
+            Scalper-owned positions are untouched (the scalper has its own
+            time-stop).
+        accept_fallback_verdicts: Audit-finding gate: when the primary AI
+            confirmation was silently answered by the FALLBACK model
+            (``settings.ollama_fallback_model``) instead of the configured
+            primary model, the candidate is conservatively skipped
+            (``ai_fallback``) unless this flag is True. The second-judge
+            path already forbids fallback substitution outright.
     """
 
     watchlist: list[str] = Field(default_factory=lambda: list(_DEFAULT_WATCHLIST))
@@ -433,6 +493,42 @@ class BotConfig(BaseModel):
     trail_activate_pct: float = 0.02
     trail_distance_pct: float = 0.015
     research_mode: bool = False
+    cooldown_minutes_after_loss: int = 90
+    stop_streak_limit: int = 3
+    stop_streak_window_hours: int = 12
+    stop_streak_pause_hours: int = 6
+    time_stop_bars: int = 0
+    accept_fallback_verdicts: bool = False
+
+    @field_validator("cooldown_minutes_after_loss")
+    @classmethod
+    def _clamp_cooldown_minutes(cls, value: int) -> int:
+        """Clamp the per-pair loss cooldown to [0, 1440] minutes (0 disables)."""
+        return min(1440, max(0, int(value)))
+
+    @field_validator("stop_streak_limit")
+    @classmethod
+    def _clamp_stop_streak_limit(cls, value: int) -> int:
+        """Clamp the stop-streak trigger count to [0, 20] (0 disables)."""
+        return min(20, max(0, int(value)))
+
+    @field_validator("stop_streak_window_hours")
+    @classmethod
+    def _clamp_stop_streak_window(cls, value: int) -> int:
+        """Clamp the stop-streak look-back window to [1, 168] hours."""
+        return min(168, max(1, int(value)))
+
+    @field_validator("stop_streak_pause_hours")
+    @classmethod
+    def _clamp_stop_streak_pause(cls, value: int) -> int:
+        """Clamp the stop-streak stand-aside duration to [1, 72] hours."""
+        return min(72, max(1, int(value)))
+
+    @field_validator("time_stop_bars")
+    @classmethod
+    def _clamp_time_stop_bars(cls, value: int) -> int:
+        """Clamp the time-stop age to [0, 500] bars (0 disables)."""
+        return min(500, max(0, int(value)))
 
     @field_validator("trail_activate_pct")
     @classmethod
@@ -745,6 +841,19 @@ class AutoTrader:
             )
             return self._finish_cycle(counters, started_ms, status="halted", halt_reason=reason)
 
+        # --- 3b) protection: stop-streak stand-aside --------------------------
+        # A burst of stop-outs means the account is fighting the tape — stand
+        # aside from NEW entries for a while (risk rule, so research_mode does
+        # not bypass it). Position management already ran above, exactly like
+        # the engine halt gate: exits always keep working.
+        if self._stop_streak_stand_aside(config):
+            return self._finish_cycle(
+                counters,
+                started_ms,
+                status="halted",
+                halt_reason="protection_stop_streak",
+            )
+
         # --- 4) scan the watchlist -------------------------------------------
         # Per-coin coach playbook — read ONCE per cycle (contract: one query,
         # not one per symbol). Empty when the coach/intel layer is absent.
@@ -944,6 +1053,12 @@ class AutoTrader:
                     counters["exited"] += 1
                     self._log_exit(closed, str(closed.get("exit_reason") or "stop_loss"))
 
+                # Time-stop protection (before the data-quality guards below:
+                # a position's AGE is a clock fact — it must expire even when
+                # the candle feed is too short or stale for the flip check).
+                if config.time_stop_bars > 0:
+                    self._apply_time_stop(config, key, scalper_ids, counters)
+
                 df = get_ohlcv(source, symbol, timeframe, limit=500, with_features=True)
                 df = _drop_unclosed_candle(df, timeframe)
                 if len(df) < _MIN_SCAN_ROWS:
@@ -1118,6 +1233,215 @@ class AutoTrader:
         except Exception:  # noqa: BLE001 — ownership info is best-effort
             logger.exception("Could not load scalper-owned position ids")
             return set()
+
+    # ------------------------------------------------------------------ #
+    # Trade protections (Freqtrade-style risk rules — active even in       #
+    # research_mode: they are risk brakes, not AI gates)                   #
+    # ------------------------------------------------------------------ #
+
+    def _protection_cooldown_blocked(
+        self, config: BotConfig, symbol: str, counters: dict[str, int]
+    ) -> bool:
+        """Per-pair loss cooldown: block re-entry right after a losing trade.
+
+        Looks for a bot-owned ``paper_positions`` row in ``symbol`` that
+        closed at a loss (``pnl < 0``) within the last
+        ``cooldown_minutes_after_loss`` minutes. Scalper-owned positions are
+        excluded via the shared ownership set, the same way
+        :meth:`_manage_positions` skips them (the set is pruned on close, so
+        a just-closed scalp may briefly still be listed — the same benign
+        race the manage pass accepts). Blocking logs a ``skip`` row with
+        reason ``protection_cooldown``. Fail-open on any read error (a
+        broken protection read must not kill the cycle) — never raises.
+
+        Args:
+            config: Active bot configuration.
+            symbol: Candidate symbol being gated.
+            counters: Cycle counters, mutated in place when blocked.
+
+        Returns:
+            True when the candidate must be skipped (cooldown active).
+        """
+        if config.cooldown_minutes_after_loss <= 0:
+            return False
+        now_ms = utc_now_ms()
+        window_start = now_ms - config.cooldown_minutes_after_loss * 60_000
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, closed_at, pnl FROM paper_positions "
+                    "WHERE symbol=? AND status='closed' AND pnl < 0 "
+                    "AND closed_at IS NOT NULL AND closed_at >= ? "
+                    "ORDER BY closed_at DESC",
+                    (symbol, window_start),
+                ).fetchall()
+        except sqlite3.Error:
+            logger.exception(
+                "Loss-cooldown lookup failed for %s — trading without it", symbol
+            )
+            return False
+        if not rows:
+            return False
+        scalper_ids = self._scalper_owned_ids()
+        loss = next(
+            (row for row in rows if int(row["id"]) not in scalper_ids), None
+        )
+        if loss is None:
+            return False
+
+        pnl = float(loss["pnl"] or 0.0)
+        minutes_ago = max(0, (now_ms - int(loss["closed_at"])) // 60_000)
+        counters["skipped"] += 1
+        self._log(
+            "skip",
+            symbol=symbol,
+            detail={
+                "reason": "protection_cooldown",
+                "pnl": _json_num(pnl),
+                "closed_ms": int(loss["closed_at"]),
+                "minutes_since_loss": int(minutes_ago),
+                "cooldown_minutes": int(config.cooldown_minutes_after_loss),
+                "explanation": (
+                    f"Skipped {symbol}: its last trade closed at a loss "
+                    f"(${pnl:+,.2f}) {int(minutes_ago)} minutes ago — new "
+                    f"entries wait out the "
+                    f"{config.cooldown_minutes_after_loss}-minute cooldown "
+                    "after a losing trade in the same pair."
+                ),
+            },
+        )
+        return True
+
+    def _stop_streak_stand_aside(self, config: BotConfig) -> bool:
+        """Stop-streak protection: stand aside after a burst of stop-outs.
+
+        Counts the bot's ``exit`` activity rows with reason ``stop_loss``
+        inside the last ``stop_streak_window_hours`` (the scalper's
+        ``scalp_exit`` rows never count — it has its own guards). At/over
+        ``stop_streak_limit`` the bot writes ONE ``halt`` row (reason
+        ``protection_stop_streak``), persists the pause end in
+        ``account_state`` (so it survives restarts without re-logging every
+        cycle) and skips all NEW entries until the pause expires; open
+        positions keep being managed by the earlier manage pass. An expired
+        pause re-arms the counter: if the window still holds a full streak,
+        a new pause (and one new ``halt`` row) begins. Fail-open on any
+        read error — never raises.
+
+        Args:
+            config: Active bot configuration.
+
+        Returns:
+            True when this cycle must skip all new entries.
+        """
+        if config.stop_streak_limit <= 0:
+            return False
+        try:
+            now_ms = utc_now_ms()
+            with self._connect() as conn:
+                raw_until = self.engine._state_get(
+                    conn, _STOP_STREAK_PAUSE_KEY, None
+                )
+            try:
+                pause_until = int(raw_until) if raw_until is not None else None
+            except (TypeError, ValueError):
+                pause_until = None
+            if pause_until is not None and now_ms < pause_until:
+                return True  # pause already announced — no halt-row spam
+
+            window_start = now_ms - config.stop_streak_window_hours * 3_600_000
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT detail FROM bot_activity "
+                    "WHERE action='exit' AND ts >= ?",
+                    (window_start,),
+                ).fetchall()
+            streak = 0
+            for row in rows:
+                try:
+                    detail = json.loads(row["detail"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(detail, dict)
+                    and str(detail.get("reason") or "") == "stop_loss"
+                ):
+                    streak += 1
+            if streak < config.stop_streak_limit:
+                return False
+
+            pause_end = now_ms + config.stop_streak_pause_hours * 3_600_000
+            with self._connect() as conn:
+                self.engine._state_set(conn, _STOP_STREAK_PAUSE_KEY, pause_end)
+            self._log(
+                "halt",
+                detail={
+                    "reason": "protection_stop_streak",
+                    "stop_losses": streak,
+                    "window_hours": int(config.stop_streak_window_hours),
+                    "pause_hours": int(config.stop_streak_pause_hours),
+                    "pause_until_ms": pause_end,
+                    "explanation": (
+                        f"Standing aside: {streak} stop-losses hit within the "
+                        f"last {config.stop_streak_window_hours}h (limit "
+                        f"{config.stop_streak_limit}) — no new entries for "
+                        f"{config.stop_streak_pause_hours}h while open "
+                        "positions keep being managed."
+                    ),
+                },
+            )
+            return True
+        except Exception:  # noqa: BLE001 — a broken protection read is fail-open
+            logger.exception("Stop-streak protection check failed — trading without it")
+            return False
+
+    def _apply_time_stop(
+        self,
+        config: BotConfig,
+        key: tuple[str, str, str],
+        scalper_ids: set[int],
+        counters: dict[str, int],
+    ) -> None:
+        """Time-stop: market-close bot positions that overstayed their welcome.
+
+        Closes every bot-owned open position matching ``key`` whose age
+        exceeds ``time_stop_bars`` bars of the position's own timeframe,
+        through the engine close path, logging the ``exit`` row (reason
+        ``time_stop``) via :meth:`_log_exit` so ``designed_r``/``realized_r``
+        are computed like every other bot exit. Scalper-owned positions are
+        never touched (the scalper runs its own time-stop). Runs even when
+        the symbol's candle data is too short/stale for the ensemble-flip
+        check — age is a clock fact, not a signal. Raises from the engine
+        close propagate to the caller's per-symbol error isolation.
+
+        Args:
+            config: Active bot configuration (supplies ``time_stop_bars``).
+            key: ``(symbol, source, timeframe)`` of the managed group.
+            scalper_ids: Scalper-owned position ids to skip.
+            counters: Cycle counters, mutated in place per close.
+        """
+        timeframe = key[2]
+        max_age = config.time_stop_bars * _timeframe_delta(timeframe)
+        now = pd.Timestamp.now(tz="UTC")
+        for position in self.engine.get_positions("open"):
+            pos_key = (
+                str(position["symbol"]),
+                str(position["source"]),
+                str(position["timeframe"]),
+            )
+            if pos_key != key or int(position["id"]) in scalper_ids:
+                continue
+            opened_ts = _opened_at_ts(position)
+            if opened_ts is None:
+                logger.warning(
+                    "Time-stop cannot read opened_at of position %s — skipped",
+                    position.get("id"),
+                )
+                continue
+            if now - opened_ts <= max_age:
+                continue
+            closed = self.engine.close_position(int(position["id"]))
+            counters["exited"] += 1
+            self._log_exit(closed, "time_stop")
 
     # ------------------------------------------------------------------ #
     # Intel/coach integration (all late-bound and fail-open: the bot keeps  #
@@ -1549,13 +1873,20 @@ class AutoTrader:
         Gate order (contract v3 — the cheap hard gates run BEFORE any LLM
         call, saving GPU time):
 
+        0. LOSS-COOLDOWN protection (when ``cooldown_minutes_after_loss``
+           > 0): a pair that just lost money is off-limits for the cooldown
+           window. A RISK RULE, so it runs BEFORE the ``research_mode``
+           bypass — research mode collects signal data, it does not disable
+           the risk brakes.
         1. REGIME gate (when ``regime_gate_enabled``): the shared
            ``regime.regime_allows`` predicate — shorts only in a coin+BTC 4h
            double-downtrend, longs blocked in exactly that state.
         2. COST gate (when ``cost_gate_multiple > 0``): the expected per-bar
            move (ATR/price) must cover ``cost_gate_multiple`` × the
            round-trip fee+slippage cost.
-        3. News-sentiment veto, then the primary AI gate (both unchanged).
+        3. News-sentiment veto, then the primary AI gate. Inside the AI
+           gate, a verdict answered by the FALLBACK model is conservatively
+           skipped (``ai_fallback``) unless ``accept_fallback_verdicts``.
 
         Intel integration: a FRESH (< 3h) news-sentiment score at/below -50
         blocks a long (skip ``news_negative``) and at/above +50 blocks a
@@ -1590,6 +1921,12 @@ class AutoTrader:
         candidate["news_context"] = None
         if regime_cache is None:
             regime_cache = {}
+
+        # 0) LOSS-COOLDOWN protection — a risk rule, checked BEFORE the
+        # research_mode bypass below: research mode disables the AI/signal
+        # gates, never the risk brakes.
+        if self._protection_cooldown_blocked(config, symbol, counters):
+            return False
 
         # Higher-timeframe context for BOTH analyst calls — factual lines
         # only, computed once per candidate from the per-cycle regime cache
@@ -1752,6 +2089,43 @@ class AutoTrader:
                 "opposing_case": str(getattr(analysis, "opposing_case", "") or ""),
             }
             candidate["ai"] = ai_detail
+
+            # Fallback-verdict gate (audit finding): chat() may silently
+            # substitute the FALLBACK model when the primary fails, and that
+            # substitute's opinion would otherwise gate this entry unnoticed.
+            # A verdict counts as a fallback only when the answering model is
+            # neither the requested primary (any tag of it) NOR unrelated to
+            # the configured fallback — i.e. it IS the fallback model. An
+            # empty ``model_used`` (older rows, stubs) never gates. The
+            # second-judge call already forbids fallback outright
+            # (``allow_fallback=False``), so this guards the primary only.
+            model_used = str(getattr(analysis, "model_used", "") or "")
+            if (
+                not config.accept_fallback_verdicts
+                and model_used
+                and not _model_installed(settings.ollama_model, [model_used])
+                and _model_installed(settings.ollama_fallback_model, [model_used])
+            ):
+                counters["skipped"] += 1
+                self._log(
+                    "skip",
+                    symbol=symbol,
+                    detail={
+                        "reason": "ai_fallback",
+                        "model_used": model_used,
+                        "model_requested": settings.ollama_model,
+                        "ai": ai_detail,
+                        "explanation": (
+                            f"Skipped {symbol}: the AI verdict came from the "
+                            f"fallback model {model_used} instead of the "
+                            f"configured {settings.ollama_model}, and fallback "
+                            "verdicts are not accepted for entries "
+                            "(accept_fallback_verdicts is off)."
+                        ),
+                    },
+                )
+                return False
+
             wanted = "bullish" if direction == "long" else "bearish"
             if analysis.sentiment != wanted or int(analysis.confidence) < config.min_ai_confidence:
                 counters["skipped"] += 1
@@ -2344,6 +2718,8 @@ class AutoTrader:
             why = "the protective stop-loss was hit"
         elif reason == "take_profit":
             why = "the take-profit target was reached"
+        elif reason == "time_stop":
+            why = "the position reached its maximum holding time (time stop)"
         else:
             why = f"exit reason: {reason}"
         explanation = (

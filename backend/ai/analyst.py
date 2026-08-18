@@ -13,6 +13,7 @@ self-repair round-trip on malformed output) and persists every result to the
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -307,7 +308,61 @@ def _parse_analysis(raw: str) -> MarketAnalysis:
     return MarketAnalysis.model_validate(payload)
 
 
-def _persist(analysis: MarketAnalysis, raw_response: str) -> None:
+#: Telemetry columns appended to ``ai_analyses``. Fresh installs get them from
+#: ``schema.sql``; databases created before this feature are migrated at
+#: runtime by ``_ensure_columns`` (ALTER TABLE ADD COLUMN is cheap and
+#: idempotent thanks to the PRAGMA check).
+_TELEMETRY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("prompt_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("latency_ms", "INTEGER"),
+    ("attempts", "INTEGER"),
+    ("fallback_used", "INTEGER NOT NULL DEFAULT 0"),
+    ("repair_used", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _prompt_hash(system_prompt: str, user_prompt: str) -> str:
+    """Fingerprint the exact prompt bytes that produced a verdict.
+
+    Args:
+        system_prompt: The system prompt sent to the model.
+        user_prompt: The user prompt sent to the model.
+
+    Returns:
+        The first 12 hex chars of sha256 over
+        ``system_prompt + "\\n" + user_prompt`` — enough to tie every
+        persisted analysis back to the prompt version that generated it.
+    """
+    joined = f"{system_prompt}\n{user_prompt}".encode("utf-8")
+    return hashlib.sha256(joined).hexdigest()[:12]
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Add any missing telemetry columns to ``ai_analyses`` (idempotent).
+
+    Runtime-safe migration for databases created before the telemetry
+    columns existed: ``PRAGMA table_info`` lists what is there and each
+    missing column is added with ``ALTER TABLE ADD COLUMN``. Never raises
+    into the caller — on failure the INSERT in ``_persist`` fails and is
+    logged there.
+
+    Args:
+        conn: An open connection to the platform database.
+    """
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(ai_analyses)")}
+        for name, decl in _TELEMETRY_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE ai_analyses ADD COLUMN {name} {decl}")
+    except sqlite3.Error:
+        logger.warning("Could not ensure ai_analyses telemetry columns", exc_info=True)
+
+
+def _persist(
+    analysis: MarketAnalysis,
+    raw_response: str,
+    telemetry: dict[str, Any] | None = None,
+) -> None:
     """Write an analysis to the ``ai_analyses`` table.
 
     Persistence failures are logged but never mask a successfully produced
@@ -316,14 +371,22 @@ def _persist(analysis: MarketAnalysis, raw_response: str) -> None:
     Args:
         analysis: The validated analysis (symbol/timeframe/model already set).
         raw_response: The raw (cleaned) model reply that produced it.
+        telemetry: Optional call telemetry: ``prompt_hash``, ``latency_ms``,
+            ``attempts``, ``fallback_used`` (0/1), ``repair_used`` (0/1).
+            Missing keys degrade to NULL / 0, never to an error.
     """
+    telemetry = telemetry or {}
+    latency_ms = telemetry.get("latency_ms")
+    attempts = telemetry.get("attempts")
     try:
         with get_conn() as conn:
+            _ensure_columns(conn)
             conn.execute(
                 "INSERT INTO ai_analyses "
                 "(created_at, model, symbol, timeframe, sentiment, confidence, "
-                " risk_commentary, key_indicators, reasoning, raw_response) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " risk_commentary, key_indicators, reasoning, raw_response, "
+                " prompt_hash, latency_ms, attempts, fallback_used, repair_used) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     utc_now_ms(),
                     analysis.model_used,
@@ -335,6 +398,11 @@ def _persist(analysis: MarketAnalysis, raw_response: str) -> None:
                     json.dumps([ki.model_dump() for ki in analysis.key_indicators]),
                     analysis.reasoning,
                     raw_response,
+                    str(telemetry.get("prompt_hash") or ""),
+                    int(latency_ms) if latency_ms is not None else None,
+                    int(attempts) if attempts is not None else None,
+                    1 if telemetry.get("fallback_used") else 0,
+                    1 if telemetry.get("repair_used") else 0,
                 ),
             )
         logger.info(
@@ -382,7 +450,10 @@ def analyze_market(
         ``timeframe`` populated and confidence clamped into [0, 100];
         ``model_used`` records the model that ACTUALLY answered (the
         resolved installed tag, or the fallback when it substituted). Every
-        result is persisted to the ``ai_analyses`` table.
+        result is persisted to the ``ai_analyses`` table together with call
+        telemetry (``prompt_hash``, ``latency_ms``, ``attempts``,
+        ``fallback_used``, ``repair_used``) so each verdict is reproducible
+        and the model's health is measurable.
 
     Raises:
         ValueError: When ``df`` is empty or missing the ``close`` column.
@@ -404,6 +475,18 @@ def analyze_market(
         prompt, system=_SYSTEM_PROMPT, model=model_name, json_mode=True,
         temperature=0.2, allow_fallback=allow_fallback,
     )
+    # Telemetry for the persisted row: the prompt fingerprint always covers
+    # the ORIGINAL analysis prompt (that is what makes the verdict
+    # reproducible); latency/attempts accumulate over the repair round-trip
+    # when it fires. A stubbed/legacy chat without stats degrades to NULLs.
+    stats = dict(getattr(client, "last_call_stats", None) or {})
+    telemetry: dict[str, Any] = {
+        "prompt_hash": _prompt_hash(_SYSTEM_PROMPT, prompt),
+        "latency_ms": stats.get("latency_ms"),
+        "attempts": stats.get("attempts"),
+        "fallback_used": 1 if stats.get("fallback_used") else 0,
+        "repair_used": 0,
+    }
     try:
         analysis = _parse_analysis(raw)
     except ValueError as exc:  # covers JSONDecodeError and ValidationError
@@ -422,6 +505,14 @@ def analyze_market(
             repair_prompt, system=_SYSTEM_PROMPT, model=model_name,
             json_mode=True, temperature=0.0, allow_fallback=allow_fallback,
         )
+        repair_stats = dict(getattr(client, "last_call_stats", None) or {})
+        telemetry["repair_used"] = 1
+        for key in ("latency_ms", "attempts"):
+            base, extra = telemetry.get(key), repair_stats.get(key)
+            if base is not None or extra is not None:
+                telemetry[key] = int(base or 0) + int(extra or 0)
+        if repair_stats.get("fallback_used"):
+            telemetry["fallback_used"] = 1
         try:
             analysis = _parse_analysis(repaired)
             raw = repaired
@@ -439,7 +530,7 @@ def analyze_market(
     analysis.symbol = symbol
     analysis.timeframe = timeframe
 
-    _persist(analysis, raw)
+    _persist(analysis, raw, telemetry)
     return analysis
 
 

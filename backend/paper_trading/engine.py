@@ -69,6 +69,56 @@ def _last_candle_ms(df: pd.DataFrame) -> int:
     return int(df.index[-1].value // 1_000_000)
 
 
+def _drop_wrong_side_levels(
+    side: str,
+    reference_price: float,
+    stop_loss: float | None,
+    take_profit: float | None,
+) -> tuple[float | None, float | None, list[str]]:
+    """Drop protective levels sitting on the WRONG side of a reference price.
+
+    A level on the wrong side of the entry would trigger on the very next
+    evaluated candle regardless of where price goes (stops additionally pay
+    adverse slippage): for a LONG position a ``stop_loss`` at or above the
+    reference price, or a ``take_profit`` at or below it, is invalid —
+    mirrored for a SHORT.
+
+    Args:
+        side: Position side, ``"long"`` or ``"short"``.
+        reference_price: The fill/mark price the levels must straddle.
+        stop_loss: Proposed stop level (``None`` → nothing to check).
+        take_profit: Proposed target level (``None`` → nothing to check).
+
+    Returns:
+        ``(stop_loss, take_profit, reasons)`` — each invalid level replaced
+        by ``None``, with one human-readable reason per dropped level.
+    """
+    reasons: list[str] = []
+    if stop_loss is not None:
+        level = float(stop_loss)
+        wrong = level >= reference_price if side == "long" else level <= reference_price
+        if wrong:
+            reasons.append(
+                f"invalid stop_loss {level:.8g} dropped: at or "
+                f"{'above' if side == 'long' else 'below'} the {side} "
+                f"reference price {reference_price:.8g} — it would trigger "
+                "immediately"
+            )
+            stop_loss = None
+    if take_profit is not None:
+        level = float(take_profit)
+        wrong = level <= reference_price if side == "long" else level >= reference_price
+        if wrong:
+            reasons.append(
+                f"invalid take_profit {level:.8g} dropped: at or "
+                f"{'below' if side == 'long' else 'above'} the {side} "
+                f"reference price {reference_price:.8g} — it would trigger "
+                "immediately"
+            )
+            take_profit = None
+    return stop_loss, take_profit, reasons
+
+
 def _watermark_key(source: str, symbol: str, timeframe: str) -> str:
     """account_state key for the last-processed-candle watermark."""
     return f"last_candle_ms:{source}:{symbol}:{timeframe}"
@@ -192,7 +242,11 @@ class PaperTradingEngine:
             limit_price: Required for limit orders.
             stop_price: Required for stop orders.
             stop_loss: Optional protective stop attached to the position.
+                A level on the wrong side of the fill price (e.g. a long's
+                stop at/above entry) is dropped at fill time — the fill
+                stands, the reason is appended to the order's ``note``.
             take_profit: Optional profit target attached to the position.
+                Wrong-side levels are dropped the same way.
             source: Data source (``binance``/``bybit``/``yahoo``).
             timeframe: Candle timeframe used for pricing.
 
@@ -922,7 +976,11 @@ class PaperTradingEngine:
         Args:
             position_id: Id of an OPEN row in ``paper_positions``.
             stop_loss: Proposed new stop price (None → leave the stop alone).
-                Must be a positive finite number to be considered.
+                Must be a positive finite number to be considered. When the
+                position has NO stop yet, the proposal must also sit on the
+                correct side of the last mark price (below it for a long,
+                above it for a short) — a wrong-side first install is
+                refused with ``stop_moved: False``.
             clear_take_profit: True → set ``take_profit`` to NULL.
 
         Returns:
@@ -951,7 +1009,25 @@ class PaperTradingEngine:
                     candidate = math.nan
                 if math.isfinite(candidate) and candidate > 0.0:
                     if current_stop is None:
-                        new_stop = candidate
+                        # A FIRST stop install has no tighten anchor, so its
+                        # side is validated against the last mark price — a
+                        # wrong-side stop would trigger immediately. Invalid
+                        # proposals reuse the not-moved signalling below.
+                        last = pos["last_price"]
+                        reference = float(
+                            last if last is not None else pos["entry_price"]
+                        )
+                        checked, _, reasons = _drop_wrong_side_levels(
+                            side, reference, candidate, None
+                        )
+                        if checked is None:
+                            logger.warning(
+                                "Position #%s: %s (paper)",
+                                position_id,
+                                reasons[0],
+                            )
+                        else:
+                            new_stop = candidate
                     elif side == "long" and candidate > float(current_stop):
                         new_stop = candidate
                     elif side == "short" and candidate < float(current_stop):
@@ -1393,6 +1469,17 @@ class PaperTradingEngine:
         )
         return int(cur.lastrowid)
 
+    @staticmethod
+    def _append_order_note(
+        conn: sqlite3.Connection, order_id: int, text: str
+    ) -> None:
+        """Append ``text`` to an order's ``note`` column ("; "-separated)."""
+        conn.execute(
+            "UPDATE paper_orders SET note = CASE WHEN note IS NULL OR note = '' "
+            "THEN ? ELSE note || '; ' || ? END WHERE id=?",
+            (text, text, int(order_id)),
+        )
+
     def _insert_trade(
         self,
         conn: sqlite3.Connection,
@@ -1457,7 +1544,9 @@ class PaperTradingEngine:
             qty: Filled quantity.
             fill_price: Executed price (already slippage-adjusted).
             slippage_cost: Total slippage cost of the fill (for the audit row).
-            stop_loss / take_profit: Levels attached to a newly opened position.
+            stop_loss / take_profit: Levels attached to a newly opened
+                position. Levels on the wrong side of ``fill_price`` are
+                dropped (with a note on the order) rather than installed.
             executed_ms: Execution time (epoch ms UTC).
             only_position_id: When set, net ONLY against this position and
                 never open a remainder (used by close_position and SL/TP).
@@ -1545,6 +1634,26 @@ class PaperTradingEngine:
             commission = total_commission * fraction
             slip_share = slippage_cost * fraction
             new_side = "long" if side == "buy" else "short"
+            # Fill-time guard: a protective level on the wrong side of the
+            # fill price would insta-trigger on the next evaluated candle
+            # (with adverse slippage for stops). Drop ONLY the offending
+            # level — the fill itself still stands (least-disruptive).
+            stop_loss, take_profit, dropped = _drop_wrong_side_levels(
+                new_side, fill_price, stop_loss, take_profit
+            )
+            if dropped:
+                explanation = "; ".join(dropped)
+                logger.warning(
+                    "Order #%s (%s %s x%.8g at %.8g): %s (paper)",
+                    order_id,
+                    side,
+                    symbol,
+                    remaining,
+                    fill_price,
+                    explanation,
+                )
+                if order_id is not None:
+                    self._append_order_note(conn, order_id, explanation)
             if side == "buy":
                 cash -= remaining * fill_price + commission
             else:

@@ -1303,11 +1303,36 @@ def run_analysis(req: AnalysisRequest) -> dict[str, Any]:
 def analysis_history(
     symbol: str | None = Query(None),
     limit: int = Query(50, ge=1),
+    include_raw: bool = Query(
+        False, description="True → include each row's raw model reply."
+    ),
 ) -> dict[str, Any]:
-    """Previously persisted AI analyses, newest first."""
+    """Previously persisted AI analyses, newest first.
+
+    ``include_raw=true`` adds each item's ``raw_response`` (the raw model
+    reply the analysis was parsed from); the default payload is unchanged.
+    """
     from backend.ai.analyst import get_analysis_history
 
-    return {"items": get_analysis_history(symbol=symbol, limit=limit)}
+    items = get_analysis_history(symbol=symbol, limit=limit)
+    if include_raw and items:
+        from backend.database.db import get_conn
+
+        ids = [int(item["id"]) for item in items]
+        placeholders = ",".join("?" for _ in ids)
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, raw_response FROM ai_analyses "
+                f"WHERE id IN ({placeholders})",  # noqa: S608 — placeholders only
+                ids,
+            ).fetchall()
+        finally:
+            conn.close()
+        raw_by_id = {int(row["id"]): row["raw_response"] for row in rows}
+        for item in items:
+            item["raw_response"] = raw_by_id.get(int(item["id"]), "")
+    return {"items": items}
 
 
 # ---------------------------------------------------------------------------
